@@ -8,17 +8,14 @@ import threading
 import zipfile
 
 from pathlib import Path
+
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 import requests
 
 
-# ============================================================
-# CORE NETWORK STORE - GRUNDEINSTELLUNGEN
-# ============================================================
-
-APP_NAME = "Core Network Store"
+APP_NAME = "Core Store"
 
 LOCAL_ROOT = (
     Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
@@ -30,31 +27,18 @@ INSTALLED_FILE = STORE_DATA / "installed.json"
 
 SETTINGS_FILE = Path(__file__).with_name("settings.json")
 
+WINDOW_BG = "#101827"
+PANEL_BG = "#172438"
+CARD_BG = "#1d2d44"
 
-# ============================================================
-# CORE NETWORK DESIGN
-# ============================================================
+TEXT = "#f4f7fb"
+MUTED = "#aab8ca"
 
-BG = "#080F1C"
-SIDEBAR = "#0B1424"
-PANEL = "#111F33"
-CARD = "#14243A"
-CARD_HOVER = "#1A304B"
+ACCENT = "#22D3EE"
+GREEN = "#22c55e"
+RED = "#ef4444"
+GOLD = "#f5c451"
 
-TEXT = "#F4F8FF"
-MUTED = "#91A5BE"
-
-CYAN = "#22D3EE"
-CYAN_DARK = "#0E7490"
-
-GREEN = "#34D399"
-RED = "#FB7185"
-GOLD = "#FBBF24"
-
-
-# ============================================================
-# DATEIEN UND EINSTELLUNGEN
-# ============================================================
 
 def load_settings():
     try:
@@ -74,13 +58,10 @@ def load_installed():
             INSTALLED_FILE.read_text(encoding="utf-8")
         )
 
-        if isinstance(data, dict):
-            return data
+        return data if isinstance(data, dict) else {}
 
     except Exception:
-        pass
-
-    return {}
+        return {}
 
 
 def save_installed(data):
@@ -104,25 +85,22 @@ def save_installed(data):
 
 
 def safe_child(root, name):
-    if not isinstance(name, str):
-        raise ValueError("Ungültiger Ordnername.")
-
     if (
-        not name
+        not isinstance(name, str)
+        or not name
         or name in (".", "..")
         or "/" in name
         or "\\" in name
-        or ":" in name
     ):
-        raise ValueError("Unsicherer Ordnername.")
+        raise ValueError("Ungültiger Programmordner.")
 
-    root = root.resolve()
-    destination = (root / name).resolve()
+    root = Path(root).resolve()
+    target = (root / name).resolve()
 
-    if destination.parent != root:
-        raise ValueError("Ungültiger Zielpfad.")
+    if target == root or root not in target.parents:
+        raise ValueError("Ungültiger Installationspfad.")
 
-    return destination
+    return target
 
 
 def safe_relative_path(value):
@@ -131,125 +109,42 @@ def safe_relative_path(value):
 
     value = value.replace("\\", "/")
 
-    if value.startswith("/") or ":" in value:
-        raise ValueError("Absolute Pfade sind nicht erlaubt.")
-
     parts = value.split("/")
 
-    if any(part in ("", ".", "..") for part in parts):
-        raise ValueError("Unsicherer relativer Pfad.")
+    if (
+        value.startswith("/")
+        or any(part in ("", ".", "..") for part in parts)
+        or (parts and ":" in parts[0])
+    ):
+        raise ValueError("Unsicherer Dateipfad.")
 
     return Path(*parts)
 
 
 def extract_safely(zip_path, destination):
-    destination = destination.resolve()
+    destination = Path(destination).resolve()
 
     with zipfile.ZipFile(zip_path, "r") as archive:
-        for info in archive.infolist():
-            relative = safe_relative_path(info.filename)
-
-            target = (destination / relative).resolve()
-
-            if (
-                target != destination
-                and destination not in target.parents
-            ):
-                raise ValueError(
-                    "Das ZIP enthält einen unsicheren Pfad."
-                )
-
-            # Keine symbolischen Links aus Archiven übernehmen.
-            unix_mode = info.external_attr >> 16
-
-            if unix_mode & 0o170000 == 0o120000:
-                raise ValueError(
-                    "Symbolische Links sind nicht erlaubt."
-                )
-
-            if info.is_dir():
-                target.mkdir(
-                    parents=True,
-                    exist_ok=True
-                )
-                continue
-
-            target.parent.mkdir(
-                parents=True,
-                exist_ok=True
+        for member in archive.infolist():
+            relative = safe_relative_path(
+                member.filename
             )
 
-            with archive.open(info) as source:
-                with target.open("wb") as output:
-                    shutil.copyfileobj(source, output)
+            target = (
+                destination / relative
+            ).resolve()
+
+            if target != destination and destination not in target.parents:
+                raise ValueError(
+                    "ZIP-Datei enthält einen unsicheren Pfad."
+                )
+
+        archive.extractall(destination)
 
 
-def launch_file(directory, relative_file, wait=False):
-    if not relative_file:
-        raise ValueError(
-            "Für dieses Programm ist keine start_file festgelegt."
-        )
-
-    relative = safe_relative_path(relative_file)
-
-    directory = directory.resolve()
-    target = (directory / relative).resolve()
-
-    if directory not in target.parents:
-        raise ValueError("Ungültiger Startpfad.")
-
-    if not target.is_file():
-        raise FileNotFoundError(
-            f"Startdatei nicht gefunden: {relative_file}"
-        )
-
-    extension = target.suffix.lower()
-
-    if extension == ".py":
-        command = [sys.executable, str(target)]
-
-    elif extension in (".bat", ".cmd"):
-        command = [
-            os.environ.get("COMSPEC", "cmd.exe"),
-            "/c",
-            str(target)
-        ]
-
-    elif extension == ".exe":
-        command = [str(target)]
-
-    elif extension in (".html", ".htm"):
-        os.startfile(str(target))
-        return None
-
-    else:
-        raise ValueError(
-            f"Dateityp wird nicht unterstützt: {extension}"
-        )
-
-    if wait:
-        return subprocess.run(
-            command,
-            cwd=str(directory),
-            check=False
-        )
-
-    subprocess.Popen(
-        command,
-        cwd=str(directory)
-    )
-
-    return None
-
-
-def download_program(api_url, program_id, destination):
-    url = (
-        f"{api_url}/api/programs/"
-        f"{program_id}/download"
-    )
-
+def download_program(program_id, destination):
     response = requests.get(
-        url,
+        f"{API_URL}/api/programs/{program_id}/download",
         stream=True,
         timeout=(20, 300)
     )
@@ -265,7 +160,7 @@ def download_program(api_url, program_id, destination):
 
         raise RuntimeError(detail)
 
-    with destination.open("wb") as output:
+    with open(destination, "wb") as output:
         for chunk in response.iter_content(
             chunk_size=256 * 1024
         ):
@@ -273,535 +168,250 @@ def download_program(api_url, program_id, destination):
                 output.write(chunk)
 
 
-# ============================================================
-# CORE STORE FENSTER
-# ============================================================
+def launch_file(program_dir, relative_file, wait=False):
+    relative = safe_relative_path(relative_file)
+
+    target = (
+        Path(program_dir) / relative
+    ).resolve()
+
+    program_dir = Path(program_dir).resolve()
+
+    if target != program_dir and program_dir not in target.parents:
+        raise ValueError(
+            "Die Startdatei liegt außerhalb des Programmordners."
+        )
+
+    if not target.is_file():
+        raise FileNotFoundError(
+            f"Datei nicht gefunden: {relative_file}"
+        )
+
+    suffix = target.suffix.lower()
+
+    if suffix == ".py":
+        command = [
+            sys.executable,
+            str(target)
+        ]
+
+        if wait:
+            return subprocess.run(
+                command,
+                cwd=str(program_dir),
+                check=False
+            )
+
+        return subprocess.Popen(
+            command,
+            cwd=str(program_dir)
+        )
+
+    if suffix in (".bat", ".cmd"):
+        command = [
+            "cmd.exe",
+            "/c",
+            str(target)
+        ]
+
+        if wait:
+            return subprocess.run(
+                command,
+                cwd=str(program_dir),
+                check=False
+            )
+
+        return subprocess.Popen(
+            command,
+            cwd=str(program_dir),
+            creationflags=getattr(
+                subprocess,
+                "CREATE_NEW_CONSOLE",
+                0
+            )
+        )
+
+    if suffix == ".exe":
+        if wait:
+            return subprocess.run(
+                [str(target)],
+                cwd=str(program_dir),
+                check=False
+            )
+
+        return subprocess.Popen(
+            [str(target)],
+            cwd=str(program_dir)
+        )
+
+    if suffix in (".html", ".htm"):
+        if wait:
+            raise ValueError(
+                "HTML-Dateien können nicht als Installationsskript verwendet werden."
+            )
+
+        os.startfile(str(target))
+        return None
+
+    raise ValueError(
+        f"Nicht unterstützter Dateityp: {suffix}"
+    )
+
+
+API_URL = load_settings()
+
 
 class CoreStore:
 
     def __init__(self, root):
         self.root = root
 
-        self.root.title(APP_NAME)
-        self.root.geometry("1280x820")
-        self.root.minsize(980, 660)
-        self.root.configure(bg=BG)
-
-        self.api_url = load_settings()
+        self.root.title("Core Store")
+        self.root.geometry("1120x760")
+        self.root.minsize(900, 620)
+        self.root.configure(bg=WINDOW_BG)
 
         self.programs = []
         self.installed = load_installed()
-
         self.current_filter = "Alle"
-        self.nav_buttons = {}
-
-        self.search_var = tk.StringVar()
 
         self.build_ui()
 
-        if not self.api_url:
+        if not API_URL:
             messagebox.showerror(
                 "API-Adresse fehlt",
-                "Trage zuerst die Render-Adresse in "
-                "client/settings.json ein."
+                "Bitte trage die Render-URL in settings.json ein."
             )
         else:
             self.refresh()
 
-
-    # ========================================================
-    # DESIGN-HILFSFUNKTIONEN
-    # ========================================================
-
-    def make_button(
-        self,
-        parent,
-        text,
-        command,
-        kind="secondary"
-    ):
-        styles = {
-            "primary": (
-                CYAN,
-                "#06202A",
-                "#67E8F9"
-            ),
-            "success": (
-                GREEN,
-                "#06251C",
-                "#6EE7B7"
-            ),
-            "danger": (
-                "#482435",
-                "#FFE8EF",
-                "#633047"
-            ),
-            "secondary": (
-                "#20344E",
-                TEXT,
-                "#2B4565"
-            ),
-            "ghost": (
-                SIDEBAR,
-                MUTED,
-                "#172A43"
-            )
-        }
-
-        bg, fg, active = styles[kind]
-
-        return tk.Button(
-            parent,
-            text=text,
-            command=command,
-            bg=bg,
-            fg=fg,
-            activebackground=active,
-            activeforeground=fg,
-            relief="flat",
-            bd=0,
-            padx=15,
-            pady=9,
-            cursor="hand2",
-            font=("Segoe UI", 9, "bold")
-        )
-
-
-    # ========================================================
-    # OBERFLÄCHE
-    # ========================================================
-
     def build_ui(self):
-
-        shell = tk.Frame(
+        header = tk.Frame(
             self.root,
-            bg=BG
-        )
-        shell.pack(
-            fill="both",
-            expand=True
-        )
-
-        # Linke Navigation
-
-        sidebar = tk.Frame(
-            shell,
-            bg=SIDEBAR,
-            width=218
-        )
-
-        sidebar.pack(
-            side="left",
-            fill="y"
-        )
-
-        sidebar.pack_propagate(False)
-
-        brand = tk.Frame(
-            sidebar,
-            bg=SIDEBAR,
-            padx=20,
-            pady=23
-        )
-        brand.pack(fill="x")
-
-        logo = tk.Canvas(
-            brand,
-            width=42,
-            height=42,
-            bg=SIDEBAR,
-            highlightthickness=0
-        )
-        logo.pack(side="left")
-
-        logo.create_oval(
-            3, 3, 39, 39,
-            outline=CYAN,
-            width=2
-        )
-
-        logo.create_text(
-            21, 21,
-            text="C",
-            fill=TEXT,
-            font=("Segoe UI", 19, "bold")
-        )
-
-        brand_text = tk.Frame(
-            brand,
-            bg=SIDEBAR
-        )
-        brand_text.pack(
-            side="left",
-            padx=10
-        )
-
-        tk.Label(
-            brand_text,
-            text="CORE",
-            bg=SIDEBAR,
-            fg=TEXT,
-            font=("Segoe UI", 15, "bold")
-        ).pack(anchor="w")
-
-        tk.Label(
-            brand_text,
-            text="NETWORK",
-            bg=SIDEBAR,
-            fg=CYAN,
-            font=("Segoe UI", 8, "bold")
-        ).pack(anchor="w")
-
-        tk.Label(
-            sidebar,
-            text="WORKSPACE",
-            bg=SIDEBAR,
-            fg="#60758F",
-            font=("Segoe UI", 8, "bold")
-        ).pack(
-            anchor="w",
-            padx=22,
-            pady=(24, 9)
-        )
-
-        navigation = [
-            ("Startseite", "⌂", "Alle"),
-            ("Programme", "▦", "Alle"),
-            ("Installiert", "↓", "Installiert")
-        ]
-
-        for label, icon, filter_name in navigation:
-
-            button = tk.Button(
-                sidebar,
-                text=f"  {icon}     {label}",
-                anchor="w",
-                command=lambda f=filter_name, n=label:
-                    self.set_filter(f, n),
-                bg="#102239" if label == "Startseite" else SIDEBAR,
-                fg=TEXT if label == "Startseite" else MUTED,
-                activebackground="#17324E",
-                activeforeground=TEXT,
-                relief="flat",
-                bd=0,
-                padx=18,
-                pady=13,
-                font=("Segoe UI", 10, "bold"),
-                cursor="hand2"
-            )
-
-            button.pack(
-                fill="x",
-                padx=12,
-                pady=3
-            )
-
-            self.nav_buttons[label] = button
-
-        bottom = tk.Frame(
-            sidebar,
-            bg=SIDEBAR,
-            padx=18,
+            bg=WINDOW_BG,
+            padx=24,
             pady=18
         )
-        bottom.pack(
-            side="bottom",
-            fill="x"
-        )
 
-        tk.Frame(
-            bottom,
-            bg="#1E354F",
-            height=1
-        ).pack(
-            fill="x",
-            pady=(0, 14)
-        )
-
-        tk.Label(
-            bottom,
-            text="CORE NETWORK",
-            bg=SIDEBAR,
-            fg="#6D849F",
-            font=("Segoe UI", 8, "bold")
-        ).pack(anchor="w")
-
-        tk.Label(
-            bottom,
-            text="Software Center  •  Desktop",
-            bg=SIDEBAR,
-            fg="#6D849F",
-            font=("Segoe UI", 8)
-        ).pack(
-            anchor="w",
-            pady=(4, 0)
-        )
-
-        # Hauptbereich
-
-        self.workspace = tk.Frame(
-            shell,
-            bg=BG
-        )
-
-        self.workspace.pack(
-            side="left",
-            fill="both",
-            expand=True
-        )
-
-        header = tk.Frame(
-            self.workspace,
-            bg=BG,
-            padx=30,
-            pady=20
-        )
         header.pack(fill="x")
 
-        title_box = tk.Frame(
+        tk.Label(
             header,
-            bg=BG
-        )
-        title_box.pack(side="left")
-
-        tk.Label(
-            title_box,
-            text="Software Center",
-            bg=BG,
+            text="CORE STORE",
             fg=TEXT,
-            font=("Segoe UI", 19, "bold")
-        ).pack(anchor="w")
+            bg=WINDOW_BG,
+            font=("Segoe UI", 22, "bold")
+        ).pack(side="left")
 
         tk.Label(
-            title_box,
-            text="Entdecke und verwalte deine Core-Programme",
-            bg=BG,
+            header,
+            text="CORE NETWORK SOFTWARE CENTER",
             fg=MUTED,
+            bg=WINDOW_BG,
             font=("Segoe UI", 9)
         ).pack(
-            anchor="w",
-            pady=(3, 0)
-        )
-
-        controls = tk.Frame(
-            header,
-            bg=BG
-        )
-        controls.pack(side="right")
-
-        search_wrap = tk.Frame(
-            controls,
-            bg=PANEL,
-            padx=12,
-            pady=2,
-            highlightthickness=1,
-            highlightbackground="#263D58"
-        )
-        search_wrap.pack(
             side="left",
-            padx=(0, 10)
+            padx=16,
+            pady=(10, 0)
         )
 
-        tk.Label(
-            search_wrap,
-            text="⌕",
-            bg=PANEL,
-            fg=CYAN,
-            font=("Segoe UI", 16)
-        ).pack(side="left", padx=(0, 6))
+        self.search_var = tk.StringVar()
 
         search = tk.Entry(
-            search_wrap,
+            header,
             textvariable=self.search_var,
-            width=25,
-            bg=PANEL,
+            width=30,
+            bg=PANEL_BG,
             fg=TEXT,
             insertbackground=TEXT,
             relief="flat",
-            font=("Segoe UI", 10)
+            font=("Segoe UI", 11)
         )
+
         search.pack(
-            side="left",
-            ipady=9
+            side="right",
+            ipady=9,
+            padx=(10, 0)
         )
 
-        search.insert(
-            0,
-            "Programme suchen..."
-        )
-
-        search.bind(
-            "<FocusIn>",
-            lambda _e:
-                search.delete(0, "end")
-                if search.get() == "Programme suchen..."
-                else None
-        )
-
+        search.insert(0, "Programme suchen...")
         search.bind(
             "<KeyRelease>",
-            lambda _e: self.render_cards()
+            lambda _event: self.render_cards()
         )
 
-        self.make_button(
-            controls,
-            "↻  Aktualisieren",
-            self.refresh,
-            "secondary"
-        ).pack(side="left")
-
-        # Banner
-
-        hero = tk.Frame(
-            self.workspace,
-            bg="#102A43",
-            padx=28,
-            pady=24,
-            highlightthickness=1,
-            highlightbackground="#1D4964"
+        nav = tk.Frame(
+            self.root,
+            bg=PANEL_BG,
+            padx=20,
+            pady=10
         )
 
-        hero.pack(
-            fill="x",
-            padx=30,
-            pady=(2, 18)
-        )
+        nav.pack(fill="x")
 
-        hero_left = tk.Frame(
-            hero,
-            bg="#102A43"
-        )
-        hero_left.pack(
-            side="left",
-            fill="both",
-            expand=True
-        )
+        for label, filter_name in [
+            ("Startseite", "Alle"),
+            ("Programme", "Alle"),
+            ("Installiert", "Installiert")
+        ]:
+            tk.Button(
+                nav,
+                text=label,
+                command=lambda value=filter_name: self.set_filter(value),
+                bg=PANEL_BG,
+                fg=TEXT,
+                activebackground=CARD_BG,
+                activeforeground=TEXT,
+                relief="flat",
+                padx=18,
+                font=("Segoe UI", 10, "bold")
+            ).pack(side="left")
 
-        tk.Label(
-            hero_left,
-            text="CORE NETWORK  /  SOFTWARE HUB",
-            bg="#102A43",
-            fg=CYAN,
-            font=("Segoe UI", 8, "bold")
-        ).pack(anchor="w")
-
-        tk.Label(
-            hero_left,
-            text="Alles für dein digitales Ökosystem.",
-            bg="#102A43",
-            fg=TEXT,
-            font=("Segoe UI", 20, "bold")
-        ).pack(
-            anchor="w",
-            pady=(8, 5)
-        )
-
-        tk.Label(
-            hero_left,
-            text="Installiere, starte und verwalte deine Programme zentral an einem Ort.",
-            bg="#102A43",
-            fg="#B5C8DC",
-            font=("Segoe UI", 9)
-        ).pack(anchor="w")
-
-        hero_right = tk.Frame(
-            hero,
-            bg="#102A43"
-        )
-        hero_right.pack(
-            side="right",
-            padx=(20, 5)
-        )
-
-        tk.Label(
-            hero_right,
-            text="C",
-            bg="#102A43",
-            fg="#1B536A",
-            font=("Segoe UI", 64, "bold")
-        ).pack()
-
-        tk.Label(
-            hero_right,
-            text="CONNECTED  •  CORE",
-            bg="#102A43",
-            fg=CYAN,
-            font=("Segoe UI", 7, "bold")
-        ).pack()
-
-        # Programmbereich
-
-        section = tk.Frame(
-            self.workspace,
-            bg=BG,
-            padx=30
-        )
-        section.pack(fill="x")
-
-        tk.Label(
-            section,
-            text="PROGRAMM-BIBLIOTHEK",
-            bg=BG,
-            fg=TEXT,
-            font=("Segoe UI", 11, "bold")
-        ).pack(side="left")
-
-        self.count_label = tk.Label(
-            section,
-            text="Wird geladen...",
-            bg=BG,
-            fg=MUTED,
-            font=("Segoe UI", 8)
-        )
-        self.count_label.pack(side="right")
+        tk.Button(
+            nav,
+            text="Aktualisieren",
+            command=self.refresh,
+            bg=ACCENT,
+            fg="#06202A",
+            activebackground="#67e8f9",
+            relief="flat",
+            padx=16
+        ).pack(side="right")
 
         self.status = tk.Label(
-            self.workspace,
+            self.root,
             text="Verbinde mit Core Store...",
-            bg=BG,
+            bg=WINDOW_BG,
             fg=MUTED,
             anchor="w",
-            padx=30,
-            pady=10,
-            font=("Segoe UI", 8)
+            padx=26,
+            pady=12
         )
+
         self.status.pack(fill="x")
 
-        list_area = tk.Frame(
-            self.workspace,
-            bg=BG
-        )
-
-        list_area.pack(
-            fill="both",
-            expand=True,
-            padx=(22, 12),
-            pady=(0, 18)
-        )
-
         self.canvas = tk.Canvas(
-            list_area,
-            bg=BG,
+            self.root,
+            bg=WINDOW_BG,
             highlightthickness=0
         )
 
         scrollbar = ttk.Scrollbar(
-            list_area,
+            self.root,
             orient="vertical",
             command=self.canvas.yview
         )
 
         self.cards_frame = tk.Frame(
             self.canvas,
-            bg=BG
+            bg=WINDOW_BG
         )
 
         self.cards_frame.bind(
             "<Configure>",
-            lambda _e:
-                self.canvas.configure(
-                    scrollregion=self.canvas.bbox("all")
-                )
+            lambda _event: self.canvas.configure(
+                scrollregion=self.canvas.bbox("all")
+            )
         )
 
         self.canvas_window = self.canvas.create_window(
@@ -816,44 +426,26 @@ class CoreStore:
 
         self.canvas.bind(
             "<Configure>",
-            lambda event:
-                self.canvas.itemconfigure(
-                    self.canvas_window,
-                    width=event.width
-                )
+            lambda event: self.canvas.itemconfigure(
+                self.canvas_window,
+                width=event.width
+            )
         )
 
         self.canvas.pack(
             side="left",
             fill="both",
-            expand=True
+            expand=True,
+            padx=(20, 0),
+            pady=(0, 20)
         )
 
         scrollbar.pack(
             side="right",
             fill="y",
-            padx=(8, 0)
+            padx=(0, 16),
+            pady=(0, 20)
         )
-
-
-    # ========================================================
-    # NAVIGATION UND STATUS
-    # ========================================================
-
-    def set_filter(self, value, nav_name=None):
-        self.current_filter = value
-
-        if nav_name:
-            for name, button in self.nav_buttons.items():
-                selected = name == nav_name
-
-                button.configure(
-                    bg="#102239" if selected else SIDEBAR,
-                    fg=TEXT if selected else MUTED
-                )
-
-        self.render_cards()
-
 
     def set_status(self, text, color=MUTED):
         self.status.config(
@@ -861,79 +453,26 @@ class CoreStore:
             fg=color
         )
 
-
-    def is_installed(self, program):
-        record = self.installed.get(program["id"])
-
-        if not record:
-            return False
-
-        try:
-            expected = safe_child(
-                LOCAL_ROOT,
-                program["folder"]
-            )
-
-            actual = Path(
-                record.get("path", "")
-            ).resolve()
-
-            return (
-                expected.exists()
-                and actual == expected
-            )
-
-        except Exception:
-            return False
-
-
-    def update_available(self, program):
-        record = self.installed.get(program["id"])
-
-        if not record:
-            return False
-
-        installed_version = str(
-            record.get("version", "")
-        )
-
-        remote_version = str(
-            program.get("version", "")
-        )
-
-        return installed_version != remote_version
-
-
-    # ========================================================
-    # PROGRAMMLISTE AKTUALISIEREN
-    # ========================================================
+    def set_filter(self, value):
+        self.current_filter = value
+        self.render_cards()
 
     def refresh(self):
-        if not self.api_url:
-            return
-
-        self.set_status(
-            "Verbinde mit Core Network...",
-            CYAN
-        )
-
         def worker():
             try:
                 response = requests.get(
-                    f"{self.api_url}/api/programs",
-                    timeout=40
+                    f"{API_URL}/api/programs",
+                    timeout=30
                 )
 
                 response.raise_for_status()
 
                 data = response.json()
 
-                programs = data.get(
+                self.programs = data.get(
                     "programs",
                     []
                 )
-
-                self.programs = programs
 
                 self.root.after(
                     0,
@@ -943,7 +482,7 @@ class CoreStore:
                 self.root.after(
                     0,
                     lambda: self.set_status(
-                        f"{len(programs)} Programme verfügbar",
+                        f"{len(self.programs)} Programme verfügbar",
                         GREEN
                     )
                 )
@@ -962,19 +501,38 @@ class CoreStore:
             daemon=True
         ).start()
 
+    def is_installed(self, program):
+        record = self.installed.get(
+            program["id"]
+        )
 
-    # ========================================================
-    # PROGRAMMKARTEN
-    # ========================================================
+        if not record:
+            return False
+
+        path = Path(
+            record.get("path", "")
+        )
+
+        return path.exists()
+
+    def is_update_available(self, program):
+        record = self.installed.get(
+            program["id"]
+        )
+
+        if not record:
+            return False
+
+        return (
+            record.get("version")
+            != program.get("version")
+        )
 
     def render_cards(self):
         for widget in self.cards_frame.winfo_children():
             widget.destroy()
 
         query = self.search_var.get().strip().lower()
-
-        if query == "programme suchen...":
-            query = ""
 
         visible = []
 
@@ -993,331 +551,213 @@ class CoreStore:
                 program.get("category", "")
             ]).lower()
 
-            if query and query not in haystack:
+            if (
+                query
+                and query != "programme suchen..."
+                and query not in haystack
+            ):
                 continue
 
             visible.append(
                 (program, installed)
             )
 
-        self.count_label.config(
-            text=f"{len(visible)} PROGRAMME"
-        )
+        for program, installed in visible:
+            self.create_card(
+                program,
+                installed
+            )
 
         if not visible:
-            empty = tk.Frame(
+            tk.Label(
                 self.cards_frame,
-                bg=PANEL,
-                padx=28,
-                pady=32
-            )
-
-            empty.pack(
-                fill="x",
-                padx=8,
-                pady=12
-            )
-
-            tk.Label(
-                empty,
-                text="◇",
-                bg=PANEL,
-                fg=CYAN,
-                font=("Segoe UI", 28)
-            ).pack()
-
-            tk.Label(
-                empty,
-                text="Keine Programme gefunden",
-                bg=PANEL,
-                fg=TEXT,
-                font=("Segoe UI", 13, "bold")
-            ).pack(pady=(8, 4))
-
-            tk.Label(
-                empty,
-                text="Passe deine Suche an oder aktualisiere die Programmliste.",
-                bg=PANEL,
+                text="Keine passenden Programme gefunden.",
+                bg=WINDOW_BG,
                 fg=MUTED,
-                font=("Segoe UI", 9)
-            ).pack()
+                font=("Segoe UI", 12)
+            ).pack(pady=40)
 
-            return
+    def create_card(self, program, installed):
+        card = tk.Frame(
+            self.cards_frame,
+            bg=CARD_BG,
+            padx=18,
+            pady=16
+        )
 
-        for program, installed in visible:
-            card = tk.Frame(
-                self.cards_frame,
-                bg=CARD,
-                padx=18,
-                pady=15,
-                highlightthickness=1,
-                highlightbackground="#203852"
-            )
+        card.pack(
+            fill="x",
+            padx=8,
+            pady=8
+        )
 
-            card.pack(
-                fill="x",
-                padx=8,
-                pady=7
-            )
+        left = tk.Frame(
+            card,
+            bg=CARD_BG
+        )
 
-            icon = tk.Canvas(
-                card,
-                width=58,
-                height=58,
-                bg=CARD,
-                highlightthickness=0
-            )
+        left.pack(
+            side="left",
+            fill="both",
+            expand=True
+        )
 
-            icon.pack(
-                side="left",
-                padx=(0, 16)
-            )
+        tk.Label(
+            left,
+            text=program.get("name", program["id"]),
+            bg=CARD_BG,
+            fg=TEXT,
+            font=("Segoe UI", 15, "bold")
+        ).pack(anchor="w")
 
-            icon.create_oval(
-                3, 3, 55, 55,
-                fill="#1A3B55",
-                outline="#28617A",
-                width=1
-            )
+        tk.Label(
+            left,
+            text=(
+                f'{program.get("category", "Sonstiges")} '
+                f'· Version {program.get("version", "?")}'
+            ),
+            bg=CARD_BG,
+            fg=MUTED,
+            font=("Segoe UI", 9)
+        ).pack(
+            anchor="w",
+            pady=(3, 8)
+        )
 
-            icon.create_text(
-                29, 29,
-                text=program.get("name", "C")[:1].upper(),
-                fill=CYAN,
-                font=("Segoe UI", 22, "bold")
-            )
+        tk.Label(
+            left,
+            text=program.get("short_description", ""),
+            bg=CARD_BG,
+            fg=TEXT,
+            wraplength=650,
+            justify="left",
+            font=("Segoe UI", 10)
+        ).pack(anchor="w")
 
-            left = tk.Frame(
-                card,
-                bg=CARD
-            )
+        right = tk.Frame(
+            card,
+            bg=CARD_BG
+        )
 
-            left.pack(
-                side="left",
-                fill="both",
-                expand=True
-            )
+        right.pack(
+            side="right",
+            padx=(12, 0)
+        )
 
-            top = tk.Frame(
-                left,
-                bg=CARD
-            )
-            top.pack(fill="x")
+        self.button(
+            right,
+            "Details",
+            lambda p=program: self.show_details(p),
+            "#33465f"
+        )
 
-            tk.Label(
-                top,
-                text=program.get("name", program["id"]),
-                bg=CARD,
-                fg=TEXT,
-                font=("Segoe UI", 12, "bold")
-            ).pack(side="left")
-
-            if installed:
-                tk.Label(
-                    top,
-                    text=" INSTALLED ",
-                    bg="#123B35",
-                    fg=GREEN,
-                    font=("Segoe UI", 7, "bold"),
-                    padx=7,
-                    pady=3
-                ).pack(
-                    side="left",
-                    padx=10
+        if installed:
+            if self.is_update_available(program):
+                self.button(
+                    right,
+                    "Update",
+                    lambda p=program: self.update_program(p),
+                    GOLD,
+                    "#202020"
                 )
 
-            if installed and self.update_available(program):
-                tk.Label(
-                    top,
-                    text=" UPDATE AVAILABLE ",
-                    bg="#493817",
-                    fg=GOLD,
-                    font=("Segoe UI", 7, "bold"),
-                    padx=7,
-                    pady=3
-                ).pack(side="left")
-
-            tk.Label(
-                left,
-                text=(
-                    f'{program.get("category", "Sonstiges").upper()}'
-                    f'   •   VERSION {program.get("version", "?")}'
-                ),
-                bg=CARD,
-                fg=CYAN,
-                font=("Segoe UI", 7, "bold")
-            ).pack(
-                anchor="w",
-                pady=(5, 6)
-            )
-
-            tk.Label(
-                left,
-                text=program.get("short_description", ""),
-                bg=CARD,
-                fg=MUTED,
-                wraplength=570,
-                justify="left",
-                font=("Segoe UI", 9)
-            ).pack(anchor="w")
-
-            right = tk.Frame(
-                card,
-                bg=CARD
-            )
-
-            right.pack(
-                side="right",
-                padx=(14, 0)
-            )
-
-            self.make_button(
+            self.button(
                 right,
-                "Details",
-                lambda p=program: self.show_details(p),
-                "secondary"
-            ).pack(
-                fill="x",
-                pady=3
+                "Starten",
+                lambda p=program: self.start_program(p),
+                ACCENT,
+                "#06202A"
             )
 
-            if installed:
-                self.make_button(
-                    right,
-                    "▶  Starten",
-                    lambda p=program: self.start_program(p),
-                    "primary"
-                ).pack(
-                    fill="x",
-                    pady=3
-                )
+            self.button(
+                right,
+                "Deinstallieren",
+                lambda p=program: self.uninstall_program(p),
+                "#56313b"
+            )
 
-                if self.update_available(program):
-                    self.make_button(
-                        right,
-                        "↻  Update",
-                        lambda p=program: self.update_program(p),
-                        "success"
-                    ).pack(
-                        fill="x",
-                        pady=3
-                    )
+        else:
+            self.button(
+                right,
+                "Installieren",
+                lambda p=program: self.install_program(p),
+                GREEN,
+                "#07130b"
+            )
 
-                self.make_button(
-                    right,
-                    "Deinstallieren",
-                    lambda p=program: self.uninstall_program(p),
-                    "danger"
-                ).pack(
-                    fill="x",
-                    pady=3
-                )
-
-            else:
-                self.make_button(
-                    right,
-                    "＋  Installieren",
-                    lambda p=program: self.install_program(p),
-                    "success"
-                ).pack(
-                    fill="x",
-                    pady=3
-                )
-
-
-    # ========================================================
-    # DETAILFENSTER
-    # ========================================================
+    def button(
+        self,
+        parent,
+        text,
+        command,
+        background,
+        foreground="white"
+    ):
+        tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=background,
+            fg=foreground,
+            activebackground=background,
+            relief="flat",
+            padx=15,
+            pady=8
+        ).pack(
+            pady=3,
+            fill="x"
+        )
 
     def show_details(self, program):
         win = tk.Toplevel(self.root)
 
         win.title(
-            f'Core Network · {program.get("name", "Programm")}'
+            program.get("name", "Programm")
         )
 
-        win.geometry("700x540")
-        win.minsize(560, 440)
-        win.configure(bg=BG)
+        win.geometry("620x470")
+        win.configure(bg=WINDOW_BG)
 
-        banner = tk.Frame(
+        tk.Label(
             win,
-            bg="#102A43",
-            padx=26,
-            pady=22
-        )
-
-        banner.pack(fill="x")
-
-        tk.Label(
-            banner,
-            text="CORE NETWORK  /  PROGRAM DETAILS",
-            bg="#102A43",
-            fg=CYAN,
-            font=("Segoe UI", 8, "bold")
-        ).pack(anchor="w")
-
-        tk.Label(
-            banner,
             text=program.get("name", ""),
-            bg="#102A43",
+            bg=WINDOW_BG,
             fg=TEXT,
             font=("Segoe UI", 22, "bold")
         ).pack(
             anchor="w",
-            pady=(8, 4)
+            padx=24,
+            pady=(24, 6)
         )
 
         tk.Label(
-            banner,
-            text=(
-                f'{program.get("category", "Sonstiges")}'
-                f'  •  Version {program.get("version", "?")}'
-            ),
-            bg="#102A43",
-            fg="#B5C8DC",
-            font=("Segoe UI", 9)
-        ).pack(anchor="w")
-
-        content = tk.Frame(
             win,
-            bg=BG,
-            padx=26,
-            pady=22
-        )
-
-        content.pack(
-            fill="both",
-            expand=True
-        )
-
-        tk.Label(
-            content,
-            text="ÜBER DIESES PROGRAMM",
-            bg=BG,
-            fg=CYAN,
-            font=("Segoe UI", 8, "bold")
+            text=(
+                f'{program.get("category", "Sonstiges")} '
+                f'· Version {program.get("version", "?")}'
+            ),
+            bg=WINDOW_BG,
+            fg=MUTED
         ).pack(
             anchor="w",
-            pady=(0, 8)
+            padx=24
         )
 
         body = tk.Text(
-            content,
-            bg=PANEL,
+            win,
+            bg=PANEL_BG,
             fg=TEXT,
             insertbackground=TEXT,
             relief="flat",
             wrap="word",
-            font=("Segoe UI", 10),
-            padx=16,
-            pady=14,
-            height=12
+            font=("Segoe UI", 11)
         )
 
         body.pack(
             fill="both",
-            expand=True
+            expand=True,
+            padx=24,
+            pady=20
         )
 
         body.insert(
@@ -1330,67 +770,6 @@ class CoreStore:
 
         body.config(state="disabled")
 
-        actions = tk.Frame(
-            content,
-            bg=BG
-        )
-
-        actions.pack(
-            fill="x",
-            pady=(18, 0)
-        )
-
-        installed = self.is_installed(program)
-
-        if installed:
-            self.make_button(
-                actions,
-                "▶  Starten",
-                lambda: self.start_program(program),
-                "primary"
-            ).pack(
-                side="left",
-                padx=(0, 8)
-            )
-
-            if self.update_available(program):
-                self.make_button(
-                    actions,
-                    "↻  Update",
-                    lambda: self.update_program(program),
-                    "success"
-                ).pack(
-                    side="left",
-                    padx=(0, 8)
-                )
-
-            self.make_button(
-                actions,
-                "Deinstallieren",
-                lambda: self.uninstall_program(program),
-                "danger"
-            ).pack(side="left")
-
-        else:
-            self.make_button(
-                actions,
-                "＋  Installieren",
-                lambda: self.install_program(program),
-                "success"
-            ).pack(side="left")
-
-        self.make_button(
-            actions,
-            "Schließen",
-            win.destroy,
-            "ghost"
-        ).pack(side="right")
-
-
-    # ========================================================
-    # PROGRAMM INSTALLIEREN
-    # ========================================================
-
     def install_program(self, program):
         if not messagebox.askyesno(
             "Installieren",
@@ -1400,10 +779,12 @@ class CoreStore:
 
         self.set_status(
             f'{program["name"]} wird installiert...',
-            CYAN
+            ACCENT
         )
 
         def worker():
+            destination = None
+
             try:
                 LOCAL_ROOT.mkdir(
                     parents=True,
@@ -1427,13 +808,12 @@ class CoreStore:
                     zip_path = temp / "program.zip"
                     staging = temp / "extracted"
 
-                    staging.mkdir()
-
                     download_program(
-                        self.api_url,
                         program["id"],
                         zip_path
                     )
+
+                    staging.mkdir()
 
                     extract_safely(
                         zip_path,
@@ -1450,8 +830,9 @@ class CoreStore:
                         str(destination)
                     )
 
-                # Nur bei einer Neuinstallation ausführen.
-                post_file = program.get("post_install_file")
+                post_file = program.get(
+                    "post_install_file"
+                )
 
                 if post_file:
                     result = launch_file(
@@ -1460,12 +841,10 @@ class CoreStore:
                         wait=True
                     )
 
-                    if (
-                        result is not None
-                        and result.returncode != 0
-                    ):
+                    if result and result.returncode != 0:
                         raise RuntimeError(
-                            "post_install_file wurde nicht erfolgreich beendet."
+                            "post_install_file wurde mit "
+                            f"Exit-Code {result.returncode} beendet."
                         )
 
                 self.installed[program["id"]] = {
@@ -1511,74 +890,43 @@ class CoreStore:
             daemon=True
         ).start()
 
-
-    # ========================================================
-    # PROGRAMM UPDATE
-    # ========================================================
-
     def update_program(self, program):
-        if not self.is_installed(program):
-            messagebox.showerror(
-                "Update nicht möglich",
-                "Das Programm ist nicht korrekt installiert."
-            )
-            return
-
-        record = self.installed[program["id"]]
-
-        old_version = record.get(
-            "version",
-            "unbekannt"
-        )
-
-        new_version = program.get(
-            "version",
-            "unbekannt"
-        )
-
-        preserve = program.get(
-            "update_preserve",
-            []
-        )
-
         if not messagebox.askyesno(
             "Programm aktualisieren",
             (
                 f'{program["name"]} aktualisieren?\n\n'
-                f'Installiert: {old_version}\n'
-                f'Verfügbar: {new_version}\n\n'
-                "Der alte Programmcode wird ersetzt.\n"
-                "Die festgelegten Dateien und Ordner bleiben erhalten.\n\n"
-                "Während des Updates wird keine Programmdatei ausgeführt."
+                "Die in update_preserve angegebenen Dateien "
+                "und Ordner bleiben erhalten."
             )
         ):
             return
 
         self.set_status(
             f'{program["name"]} wird aktualisiert...',
-            CYAN
+            ACCENT
         )
 
         def worker():
-            destination = safe_child(
-                LOCAL_ROOT,
-                program["folder"]
-            )
-
-            backup = None
-
             try:
-                with tempfile.TemporaryDirectory() as temp_name:
-                    temp = Path(temp_name)
+                old_dir = safe_child(
+                    LOCAL_ROOT,
+                    program["folder"]
+                )
+
+                if not old_dir.exists():
+                    raise FileNotFoundError(
+                        "Die bisherige Installation wurde nicht gefunden."
+                    )
+
+                with tempfile.TemporaryDirectory() as temp:
+                    temp = Path(temp)
 
                     zip_path = temp / "program.zip"
-                    staging = temp / "new_program"
+                    staging = temp / "staging"
 
                     staging.mkdir()
 
-                    # Neue Version herunterladen.
                     download_program(
-                        self.api_url,
                         program["id"],
                         zip_path
                     )
@@ -1588,33 +936,16 @@ class CoreStore:
                         staging
                     )
 
-                    if not any(staging.iterdir()):
-                        raise ValueError(
-                            "Die neue Programmversion ist leer."
-                        )
+                    preserve = program.get(
+                        "update_preserve",
+                        []
+                    )
 
-                    # Alte Dateien aus update_preserve übernehmen.
                     for entry in preserve:
                         relative = safe_relative_path(entry)
 
-                        old_item = (
-                            destination / relative
-                        ).resolve()
-
-                        new_item = (
-                            staging / relative
-                        ).resolve()
-
-                        if (
-                            destination.resolve() not in old_item.parents
-                            or staging.resolve() not in new_item.parents
-                        ):
-                            raise ValueError(
-                                f"Unsicherer Update-Pfad: {entry}"
-                            )
-
-                        if not old_item.exists():
-                            continue
+                        old_item = old_dir / relative
+                        new_item = staging / relative
 
                         if old_item.is_dir():
                             if new_item.exists():
@@ -1623,20 +954,12 @@ class CoreStore:
                                 else:
                                     new_item.unlink()
 
-                            new_item.parent.mkdir(
-                                parents=True,
-                                exist_ok=True
-                            )
-
                             shutil.copytree(
                                 old_item,
                                 new_item
                             )
 
                         elif old_item.is_file():
-                            if new_item.exists() and new_item.is_dir():
-                                shutil.rmtree(new_item)
-
                             new_item.parent.mkdir(
                                 parents=True,
                                 exist_ok=True
@@ -1647,39 +970,35 @@ class CoreStore:
                                 new_item
                             )
 
-                    # Altes Programm sichern.
                     backup = LOCAL_ROOT / (
-                        f"_backup_{program['id']}"
+                        "_backup_" + program["id"]
                     )
 
                     if backup.exists():
                         shutil.rmtree(backup)
 
-                    destination.rename(backup)
+                    old_dir.rename(backup)
 
                     try:
-                        staging.rename(destination)
+                        staging.rename(old_dir)
+
+                        self.installed[program["id"]] = {
+                            "path": str(old_dir),
+                            "version": program.get("version", "1.0.0"),
+                            "folder": program["folder"]
+                        }
+
+                        save_installed(self.installed)
 
                     except Exception:
-                        if destination.exists():
-                            shutil.rmtree(destination)
+                        if old_dir.exists():
+                            shutil.rmtree(old_dir)
 
-                        backup.rename(destination)
-                        backup = None
+                        backup.rename(old_dir)
                         raise
 
-                # Neue Version registrieren.
-                self.installed[program["id"]] = {
-                    "path": str(destination),
-                    "version": new_version,
-                    "folder": program["folder"]
-                }
-
-                save_installed(self.installed)
-
-                # Backup erst nach erfolgreicher Registrierung löschen.
-                if backup and backup.exists():
-                    shutil.rmtree(backup)
+                    if backup.exists():
+                        shutil.rmtree(backup)
 
                 self.root.after(
                     0,
@@ -1695,17 +1014,6 @@ class CoreStore:
                 )
 
             except Exception as exc:
-                # Falls etwas schiefgeht, wenn möglich zurückrollen.
-                try:
-                    if backup and backup.exists():
-                        if destination.exists():
-                            shutil.rmtree(destination)
-
-                        backup.rename(destination)
-
-                except Exception:
-                    pass
-
                 self.root.after(
                     0,
                     lambda: self.set_status(
@@ -1727,24 +1035,17 @@ class CoreStore:
             daemon=True
         ).start()
 
-
-    # ========================================================
-    # PROGRAMM STARTEN
-    # ========================================================
-
     def start_program(self, program):
-        if not self.is_installed(program):
-            messagebox.showerror(
-                "Nicht installiert",
-                "Dieses Programm ist nicht installiert."
-            )
-            return
-
         try:
             directory = safe_child(
                 LOCAL_ROOT,
                 program["folder"]
             )
+
+            if not directory.exists():
+                raise FileNotFoundError(
+                    "Der lokale Programmordner wurde nicht gefunden."
+                )
 
             launch_file(
                 directory,
@@ -1757,24 +1058,12 @@ class CoreStore:
                 str(exc)
             )
 
-
-    # ========================================================
-    # PROGRAMM DEINSTALLIEREN
-    # ========================================================
-
     def uninstall_program(self, program):
-        if not self.is_installed(program):
-            messagebox.showerror(
-                "Nicht installiert",
-                "Das Programm ist nicht korrekt installiert."
-            )
-            return
-
         if not messagebox.askyesno(
             "Deinstallieren",
             (
-                f'{program["name"]} und alle Dateien '
-                "im zugehörigen Programmordner löschen?\n\n"
+                f'{program["name"]} und alle Dateien im '
+                "zugehörigen Programmordner löschen?\n\n"
                 "Es wird keine Datei ausgeführt."
             )
         ):
@@ -1809,10 +1098,6 @@ class CoreStore:
                 str(exc)
             )
 
-
-# ============================================================
-# START
-# ============================================================
 
 def main():
     STORE_DATA.mkdir(
