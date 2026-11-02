@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -8,55 +9,75 @@ import threading
 import zipfile
 
 from pathlib import Path
-
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import ttk, messagebox
 
 import requests
 
 
+# ============================================================
+# GRUNDEINSTELLUNGEN
+# ============================================================
+
 APP_NAME = "Core Store"
 
-LOCAL_ROOT = (
-    Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
-    / "Core Network"
+BASE_DIR = Path(__file__).resolve().parent
+SETTINGS_FILE = BASE_DIR / "settings.json"
+
+LOCAL_APPDATA = Path(
+    os.getenv("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
 )
 
-STORE_DATA = LOCAL_ROOT / "_store"
+STORE_ROOT = LOCAL_APPDATA / "Core Network"
+INSTALL_ROOT = STORE_ROOT / "Programs"
+STORE_DATA = STORE_ROOT / "_store"
+
 INSTALLED_FILE = STORE_DATA / "installed.json"
 
-SETTINGS_FILE = Path(__file__).with_name("settings.json")
+REQUEST_TIMEOUT = 120
 
-WINDOW_BG = "#101827"
-PANEL_BG = "#172438"
-CARD_BG = "#1d2d44"
+STORE_ROOT.mkdir(parents=True, exist_ok=True)
+INSTALL_ROOT.mkdir(parents=True, exist_ok=True)
+STORE_DATA.mkdir(parents=True, exist_ok=True)
 
-TEXT = "#f4f7fb"
-MUTED = "#aab8ca"
 
-ACCENT = "#22D3EE"
-GREEN = "#22c55e"
-RED = "#ef4444"
-GOLD = "#f5c451"
-
+# ============================================================
+# EINSTELLUNGEN
+# ============================================================
 
 def load_settings():
-    try:
-        data = json.loads(
-            SETTINGS_FILE.read_text(encoding="utf-8")
+    if not SETTINGS_FILE.exists():
+        raise RuntimeError(
+            "settings.json fehlt im client-Ordner."
         )
 
-        return data.get("api_url", "").rstrip("/")
+    with open(SETTINGS_FILE, "r", encoding="utf-8") as file:
+        settings = json.load(file)
 
-    except Exception:
-        return ""
+    api_url = settings.get("api_url", "").strip().rstrip("/")
 
+    if not api_url.startswith(("https://", "http://")):
+        raise RuntimeError(
+            "In settings.json ist keine gültige api_url eingetragen."
+        )
+
+    return api_url
+
+
+API_URL = load_settings()
+
+
+# ============================================================
+# INSTALLIERTE PROGRAMME
+# ============================================================
 
 def load_installed():
+    if not INSTALLED_FILE.exists():
+        return {}
+
     try:
-        data = json.loads(
-            INSTALLED_FILE.read_text(encoding="utf-8")
-        )
+        with open(INSTALLED_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
 
         return data if isinstance(data, dict) else {}
 
@@ -65,201 +86,541 @@ def load_installed():
 
 
 def save_installed(data):
-    STORE_DATA.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
     temporary = INSTALLED_FILE.with_suffix(".tmp")
 
-    temporary.write_text(
-        json.dumps(
-            data,
-            indent=2,
-            ensure_ascii=False
-        ),
-        encoding="utf-8"
-    )
+    with open(temporary, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=4, ensure_ascii=False)
 
-    temporary.replace(INSTALLED_FILE)
+    os.replace(temporary, INSTALLED_FILE)
 
 
-def safe_child(root, name):
-    if (
-        not isinstance(name, str)
-        or not name
-        or name in (".", "..")
-        or "/" in name
-        or "\\" in name
-    ):
-        raise ValueError("Ungültiger Programmordner.")
+# ============================================================
+# DATEIPFAD-SICHERHEIT
+# ============================================================
 
-    root = Path(root).resolve()
-    target = (root / name).resolve()
+def validate_program_id(program_id):
+    if not isinstance(program_id, str):
+        raise ValueError("Ungültige Programm-ID.")
 
-    if target == root or root not in target.parents:
-        raise ValueError("Ungültiger Installationspfad.")
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", program_id):
+        raise ValueError("Ungültige Programm-ID.")
 
-    return target
+    return program_id
+
+
+def safe_child(parent, relative):
+    """
+    Gibt nur Pfade zurück, die innerhalb von parent liegen.
+    """
+
+    parent = Path(parent).resolve()
+    relative = str(relative).replace("\\", "/")
+
+    if not relative or relative.startswith("/"):
+        raise ValueError("Ungültiger Dateipfad.")
+
+    if ":" in relative:
+        raise ValueError("Ungültiger Dateipfad.")
+
+    parts = relative.split("/")
+
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError("Ungültiger Dateipfad.")
+
+    result = (parent / Path(*parts)).resolve()
+
+    try:
+        result.relative_to(parent)
+    except ValueError:
+        raise ValueError("Dateipfad liegt außerhalb des Programmordners.")
+
+    return result
 
 
 def safe_relative_path(value):
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("Ungültiger relativer Pfad.")
+    if not isinstance(value, str) or not value:
+        raise ValueError("Leerer Dateipfad.")
 
     value = value.replace("\\", "/")
 
+    if value.startswith("/") or ":" in value:
+        raise ValueError("Ungültiger relativer Pfad.")
+
     parts = value.split("/")
 
-    if (
-        value.startswith("/")
-        or any(part in ("", ".", "..") for part in parts)
-        or (parts and ":" in parts[0])
-    ):
-        raise ValueError("Unsicherer Dateipfad.")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError("Ungültiger relativer Pfad.")
 
-    return Path(*parts)
+    return "/".join(parts)
 
+
+# ============================================================
+# PROGRAMM-DOWNLOAD
+# ============================================================
+
+def download_program(program_id, destination):
+    url = f"{API_URL}/api/programs/{program_id}/download"
+
+    response = requests.get(
+        url,
+        timeout=REQUEST_TIMEOUT,
+        stream=True
+    )
+
+    if response.status_code != 200:
+        try:
+            error = response.json().get("error", response.text)
+        except Exception:
+            error = response.text
+
+        raise RuntimeError(
+            f"Download fehlgeschlagen: {error}"
+        )
+
+    with open(destination, "wb") as file:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                file.write(chunk)
+
+
+# ============================================================
+# ZIP-EXTRAKTION
+# ============================================================
 
 def extract_safely(zip_path, destination):
     destination = Path(destination).resolve()
+    destination.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(zip_path, "r") as archive:
-        for member in archive.infolist():
-            relative = safe_relative_path(
-                member.filename
-            )
+        for item in archive.infolist():
 
-            target = (
-                destination / relative
-            ).resolve()
+            name = item.filename.replace("\\", "/")
 
-            if target != destination and destination not in target.parents:
+            if name.endswith("/"):
+                continue
+
+            relative = safe_relative_path(name)
+            target = safe_child(destination, relative)
+
+            # Symbolische Links nicht extrahieren.
+            unix_mode = (item.external_attr >> 16) & 0xFFFF
+
+            if unix_mode and (unix_mode & 0o170000) == 0o120000:
                 raise ValueError(
-                    "ZIP-Datei enthält einen unsicheren Pfad."
+                    f"Symbolische Links sind nicht erlaubt: {name}"
                 )
 
-        archive.extractall(destination)
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            with archive.open(item, "r") as source:
+                with open(target, "wb") as output:
+                    shutil.copyfileobj(source, output)
 
 
-def download_program(program_id, destination):
-    response = requests.get(
-        f"{API_URL}/api/programs/{program_id}/download",
-        stream=True,
-        timeout=(20, 300)
-    )
+# ============================================================
+# PROGRAMM-DATEIEN AUSFÜHREN
+# ============================================================
 
-    if response.status_code >= 400:
-        try:
-            detail = response.json().get(
-                "error",
-                response.text
-            )
-        except Exception:
-            detail = response.text
+def execute_file(
+    program_dir,
+    relative_file,
+    wait=True,
+    show_console=True,
+    action="start"
+):
+    """
+    Führt die in programs.json eingetragene Datei aus.
 
-        raise RuntimeError(detail)
+    Unterstützt:
+    - .bat
+    - .cmd
+    - .py
+    - .exe
+    - .ps1
+    - .html / .htm (nur Start)
+    """
 
-    with open(destination, "wb") as output:
-        for chunk in response.iter_content(
-            chunk_size=256 * 1024
-        ):
-            if chunk:
-                output.write(chunk)
-
-
-def launch_file(program_dir, relative_file, wait=False):
-    relative = safe_relative_path(relative_file)
-
-    target = (
-        Path(program_dir) / relative
-    ).resolve()
-
-    program_dir = Path(program_dir).resolve()
-
-    if target != program_dir and program_dir not in target.parents:
-        raise ValueError(
-            "Die Startdatei liegt außerhalb des Programmordners."
-        )
-
-    if not target.is_file():
-        raise FileNotFoundError(
-            f"Datei nicht gefunden: {relative_file}"
-        )
-
-    suffix = target.suffix.lower()
-
-    if suffix == ".py":
-        command = [
-            sys.executable,
-            str(target)
-        ]
-
-        if wait:
-            return subprocess.run(
-                command,
-                cwd=str(program_dir),
-                check=False
-            )
-
-        return subprocess.Popen(
-            command,
-            cwd=str(program_dir)
-        )
-
-    if suffix in (".bat", ".cmd"):
-        command = [
-            "cmd.exe",
-            "/c",
-            str(target)
-        ]
-
-        if wait:
-            return subprocess.run(
-                command,
-                cwd=str(program_dir),
-                check=False
-            )
-
-        return subprocess.Popen(
-            command,
-            cwd=str(program_dir),
-            creationflags=getattr(
-                subprocess,
-                "CREATE_NEW_CONSOLE",
-                0
-            )
-        )
-
-    if suffix == ".exe":
-        if wait:
-            return subprocess.run(
-                [str(target)],
-                cwd=str(program_dir),
-                check=False
-            )
-
-        return subprocess.Popen(
-            [str(target)],
-            cwd=str(program_dir)
-        )
-
-    if suffix in (".html", ".htm"):
-        if wait:
-            raise ValueError(
-                "HTML-Dateien können nicht als Installationsskript verwendet werden."
-            )
-
-        os.startfile(str(target))
+    if not relative_file:
         return None
 
-    raise ValueError(
-        f"Nicht unterstützter Dateityp: {suffix}"
+    relative_file = safe_relative_path(relative_file)
+    program_dir = Path(program_dir).resolve()
+
+    file_path = safe_child(program_dir, relative_file)
+
+    if not file_path.is_file():
+        raise FileNotFoundError(
+            f"Die konfigurierte Datei existiert nicht:\n{relative_file}"
+        )
+
+    extension = file_path.suffix.lower()
+
+    if extension in (".html", ".htm"):
+        if action != "start":
+            raise ValueError(
+                "HTML-Dateien können nur als Startdatei verwendet werden."
+            )
+
+        os.startfile(str(file_path))
+        return None
+
+    if extension == ".py":
+        command = [
+            sys.executable,
+            str(file_path)
+        ]
+
+    elif extension in (".bat", ".cmd"):
+        command = [
+            os.environ.get("COMSPEC", "cmd.exe"),
+            "/c",
+            str(file_path)
+        ]
+
+    elif extension == ".exe":
+        command = [str(file_path)]
+
+    elif extension == ".ps1":
+        command = [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(file_path)
+        ]
+
+    else:
+        raise ValueError(
+            f"Nicht unterstützter Dateityp: {extension}"
+        )
+
+    environment = os.environ.copy()
+    environment["CORE_STORE_PROGRAM_DIR"] = str(program_dir)
+    environment["CORE_STORE_ACTION"] = action
+
+    creation_flags = 0
+
+    if os.name == "nt" and not show_console:
+        creation_flags = subprocess.CREATE_NO_WINDOW
+
+    process = subprocess.Popen(
+        command,
+        cwd=str(program_dir),
+        env=environment,
+        creationflags=creation_flags
+    )
+
+    if wait:
+        return_code = process.wait()
+
+        if return_code != 0:
+            raise RuntimeError(
+                f"Die Datei {relative_file} wurde mit Fehlercode "
+                f"{return_code} beendet."
+            )
+
+    return process
+
+
+# ============================================================
+# KONFIGURATION AUSWERTEN
+# ============================================================
+
+def get_file_setting(program, action):
+    files = program.get("files", {})
+
+    if not isinstance(files, dict):
+        raise ValueError("Ungültige files-Konfiguration.")
+
+    return files.get(action)
+
+
+def get_execution_setting(program, setting, default):
+    execution = program.get("execution", {})
+
+    if not isinstance(execution, dict):
+        return default
+
+    return execution.get(setting, default)
+
+
+def execute_configured(program, program_dir, action):
+    """
+    Führt die für eine Aktion konfigurierte Datei aus.
+    """
+
+    relative_file = get_file_setting(program, action)
+
+    if not relative_file:
+        return
+
+    enabled = get_execution_setting(
+        program,
+        action,
+        True
+    )
+
+    if not enabled:
+        return
+
+    wait_setting = {
+        "installation": "wait_for_installation",
+        "uninstallation": "wait_for_uninstallation",
+        "update": "wait_for_update"
+    }.get(action)
+
+    if wait_setting:
+        wait = get_execution_setting(
+            program,
+            wait_setting,
+            True
+        )
+    else:
+        wait = False
+
+    show_console = get_execution_setting(
+        program,
+        "show_console",
+        True
+    )
+
+    execute_file(
+        program_dir=program_dir,
+        relative_file=relative_file,
+        wait=wait,
+        show_console=show_console,
+        action=action
     )
 
 
-API_URL = load_settings()
+# ============================================================
+# UPDATE-DATEN ERHALTEN
+# ============================================================
 
+def preserve_user_data(program, old_directory, new_directory):
+    preserve = program.get("update_preserve", [])
+
+    if not isinstance(preserve, list):
+        raise ValueError("update_preserve muss eine Liste sein.")
+
+    for relative in preserve:
+        relative = safe_relative_path(relative)
+
+        old_path = safe_child(old_directory, relative)
+        new_path = safe_child(new_directory, relative)
+
+        if not old_path.exists():
+            continue
+
+        if new_path.exists():
+            if new_path.is_dir():
+                shutil.rmtree(new_path)
+            else:
+                new_path.unlink()
+
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if old_path.is_dir():
+            shutil.copytree(old_path, new_path)
+        else:
+            shutil.copy2(old_path, new_path)
+
+
+# ============================================================
+# INSTALLATION
+# ============================================================
+
+def install_program(program):
+    program_id = validate_program_id(program["id"])
+    target = INSTALL_ROOT / program_id
+
+    if target.exists():
+        raise RuntimeError(
+            "Dieses Programm ist bereits installiert. "
+            "Verwende stattdessen Update."
+        )
+
+    temporary_root = Path(
+        tempfile.mkdtemp(prefix="core-install-", dir=STORE_ROOT)
+    )
+
+    stage = temporary_root / "program"
+    archive = temporary_root / "program.zip"
+
+    try:
+        download_program(program_id, archive)
+        extract_safely(archive, stage)
+
+        # Installationsdatei wird vor dem Verschieben ausgeführt.
+        # CORE_STORE_PROGRAM_DIR zeigt auf das temporäre Verzeichnis.
+        execute_configured(
+            program,
+            stage,
+            "installation"
+        )
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(stage, target)
+
+        installed = load_installed()
+
+        installed[program_id] = {
+            "name": program.get("name", program_id),
+            "version": program.get("version", "0.0.0"),
+            "folder": str(target),
+            "installed": True
+        }
+
+        save_installed(installed)
+
+    finally:
+        shutil.rmtree(temporary_root, ignore_errors=True)
+
+
+# ============================================================
+# PROGRAMM STARTEN
+# ============================================================
+
+def start_program(program):
+    program_id = validate_program_id(program["id"])
+    target = INSTALL_ROOT / program_id
+
+    if not target.is_dir():
+        raise FileNotFoundError("Programm ist nicht installiert.")
+
+    execute_configured(
+        program,
+        target,
+        "start"
+    )
+
+
+# ============================================================
+# UPDATE
+# ============================================================
+
+def update_program(program):
+    program_id = validate_program_id(program["id"])
+    target = INSTALL_ROOT / program_id
+
+    if not target.is_dir():
+        raise FileNotFoundError("Programm ist nicht installiert.")
+
+    temporary_root = Path(
+        tempfile.mkdtemp(prefix="core-update-", dir=STORE_ROOT)
+    )
+
+    stage = temporary_root / "program"
+    archive = temporary_root / "program.zip"
+    backup = temporary_root / "backup"
+
+    moved_old = False
+
+    try:
+        download_program(program_id, archive)
+        extract_safely(archive, stage)
+
+        # Persönliche Dateien und Daten übernehmen.
+        preserve_user_data(
+            program,
+            target,
+            stage
+        )
+
+        # Optionales Update-Skript ausführen.
+        execute_configured(
+            program,
+            stage,
+            "update"
+        )
+
+        # Altes Verzeichnis sichern.
+        os.replace(target, backup)
+        moved_old = True
+
+        try:
+            os.replace(stage, target)
+
+        except Exception:
+            if moved_old and backup.exists() and not target.exists():
+                os.replace(backup, target)
+
+            raise
+
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+
+        installed = load_installed()
+
+        installed[program_id] = {
+            "name": program.get("name", program_id),
+            "version": program.get("version", "0.0.0"),
+            "folder": str(target),
+            "installed": True
+        }
+
+        save_installed(installed)
+
+    finally:
+        # Bei einem Fehler nach dem Verschieben versuchen,
+        # das alte Programm wiederherzustellen.
+        if moved_old and backup.exists() and not target.exists():
+            os.replace(backup, target)
+
+        shutil.rmtree(temporary_root, ignore_errors=True)
+
+
+# ============================================================
+# DEINSTALLATION
+# ============================================================
+
+def uninstall_program(program):
+    program_id = validate_program_id(program["id"])
+    target = INSTALL_ROOT / program_id
+
+    if not target.is_dir():
+        raise FileNotFoundError("Programm ist nicht installiert.")
+
+    # Zuerst Deinstallationsdatei ausführen.
+    # Bei Fehler bleibt das Programmverzeichnis erhalten.
+    execute_configured(
+        program,
+        target,
+        "uninstallation"
+    )
+
+    shutil.rmtree(target)
+
+    installed = load_installed()
+    installed.pop(program_id, None)
+    save_installed(installed)
+
+
+# ============================================================
+# API
+# ============================================================
+
+def fetch_programs():
+    response = requests.get(
+        f"{API_URL}/api/programs",
+        timeout=REQUEST_TIMEOUT
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+    programs = data.get("programs", [])
+
+    if not isinstance(programs, list):
+        raise RuntimeError("Die API hat eine ungültige Programmliste geliefert.")
+
+    return programs
+
+
+# ============================================================
+# BENUTZEROBERFLÄCHE
+# ============================================================
 
 class CoreStore:
 
@@ -267,622 +628,563 @@ class CoreStore:
         self.root = root
 
         self.root.title("Core Store")
-        self.root.geometry("1120x760")
-        self.root.minsize(900, 620)
-        self.root.configure(bg=WINDOW_BG)
+        self.root.geometry("1100x700")
+        self.root.minsize(850, 550)
+        self.root.configure(bg="#0b1220")
 
         self.programs = []
+        self.filtered_programs = []
+        self.selected_program = None
+
         self.installed = load_installed()
-        self.current_filter = "Alle"
 
+        self.setup_style()
         self.build_ui()
+        self.refresh_programs()
 
-        if not API_URL:
-            messagebox.showerror(
-                "API-Adresse fehlt",
-                "Bitte trage die Render-URL in settings.json ein."
-            )
-        else:
-            self.refresh()
+    # --------------------------------------------------------
+    # DESIGN
+    # --------------------------------------------------------
+
+    def setup_style(self):
+        style = ttk.Style()
+
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure(
+            "TFrame",
+            background="#0b1220"
+        )
+
+        style.configure(
+            "TLabel",
+            background="#0b1220",
+            foreground="#e5eefb",
+            font=("Segoe UI", 10)
+        )
+
+        style.configure(
+            "Title.TLabel",
+            font=("Segoe UI", 23, "bold"),
+            foreground="#55d6ff"
+        )
+
+        style.configure(
+            "Subtitle.TLabel",
+            font=("Segoe UI", 10),
+            foreground="#8ca3bd"
+        )
+
+        style.configure(
+            "TButton",
+            background="#12304a",
+            foreground="#ffffff",
+            padding=9,
+            borderwidth=0
+        )
+
+        style.map(
+            "TButton",
+            background=[
+                ("active", "#17618a"),
+                ("disabled", "#253449")
+            ]
+        )
+
+        style.configure(
+            "TEntry",
+            fieldbackground="#152238",
+            foreground="#ffffff",
+            insertcolor="#ffffff",
+            padding=8
+        )
+
+        style.configure(
+            "TCombobox",
+            fieldbackground="#152238",
+            foreground="#ffffff",
+            background="#152238",
+            padding=6
+        )
+
+    # --------------------------------------------------------
+    # UI AUFBAUEN
+    # --------------------------------------------------------
 
     def build_ui(self):
-        header = tk.Frame(
-            self.root,
-            bg=WINDOW_BG,
-            padx=24,
-            pady=18
-        )
-
+        header = ttk.Frame(self.root, padding=20)
         header.pack(fill="x")
 
-        tk.Label(
+        ttk.Label(
             header,
             text="CORE STORE",
-            fg=TEXT,
-            bg=WINDOW_BG,
-            font=("Segoe UI", 22, "bold")
-        ).pack(side="left")
+            style="Title.TLabel"
+        ).pack(anchor="w")
 
-        tk.Label(
+        ttk.Label(
             header,
-            text="CORE NETWORK SOFTWARE CENTER",
-            fg=MUTED,
-            bg=WINDOW_BG,
-            font=("Segoe UI", 9)
-        ).pack(
-            side="left",
-            padx=16,
-            pady=(10, 0)
-        )
+            text="Programme entdecken, installieren und verwalten",
+            style="Subtitle.TLabel"
+        ).pack(anchor="w", pady=(4, 0))
+
+        toolbar = ttk.Frame(self.root, padding=(20, 0, 20, 15))
+        toolbar.pack(fill="x")
 
         self.search_var = tk.StringVar()
 
-        search = tk.Entry(
-            header,
-            textvariable=self.search_var,
-            width=30,
-            bg=PANEL_BG,
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="flat",
-            font=("Segoe UI", 11)
+        self.search_entry = ttk.Entry(
+            toolbar,
+            textvariable=self.search_var
         )
 
-        search.pack(
-            side="right",
-            ipady=9,
-            padx=(10, 0)
-        )
-
-        search.insert(0, "Programme suchen...")
-        search.bind(
-            "<KeyRelease>",
-            lambda _event: self.render_cards()
-        )
-
-        nav = tk.Frame(
-            self.root,
-            bg=PANEL_BG,
-            padx=20,
-            pady=10
-        )
-
-        nav.pack(fill="x")
-
-        for label, filter_name in [
-            ("Startseite", "Alle"),
-            ("Programme", "Alle"),
-            ("Installiert", "Installiert")
-        ]:
-            tk.Button(
-                nav,
-                text=label,
-                command=lambda value=filter_name: self.set_filter(value),
-                bg=PANEL_BG,
-                fg=TEXT,
-                activebackground=CARD_BG,
-                activeforeground=TEXT,
-                relief="flat",
-                padx=18,
-                font=("Segoe UI", 10, "bold")
-            ).pack(side="left")
-
-        tk.Button(
-            nav,
-            text="Aktualisieren",
-            command=self.refresh,
-            bg=ACCENT,
-            fg="#06202A",
-            activebackground="#67e8f9",
-            relief="flat",
-            padx=16
-        ).pack(side="right")
-
-        self.status = tk.Label(
-            self.root,
-            text="Verbinde mit Core Store...",
-            bg=WINDOW_BG,
-            fg=MUTED,
-            anchor="w",
-            padx=26,
-            pady=12
-        )
-
-        self.status.pack(fill="x")
-
-        self.canvas = tk.Canvas(
-            self.root,
-            bg=WINDOW_BG,
-            highlightthickness=0
-        )
-
-        scrollbar = ttk.Scrollbar(
-            self.root,
-            orient="vertical",
-            command=self.canvas.yview
-        )
-
-        self.cards_frame = tk.Frame(
-            self.canvas,
-            bg=WINDOW_BG
-        )
-
-        self.cards_frame.bind(
-            "<Configure>",
-            lambda _event: self.canvas.configure(
-                scrollregion=self.canvas.bbox("all")
-            )
-        )
-
-        self.canvas_window = self.canvas.create_window(
-            (0, 0),
-            window=self.cards_frame,
-            anchor="nw"
-        )
-
-        self.canvas.configure(
-            yscrollcommand=scrollbar.set
-        )
-
-        self.canvas.bind(
-            "<Configure>",
-            lambda event: self.canvas.itemconfigure(
-                self.canvas_window,
-                width=event.width
-            )
-        )
-
-        self.canvas.pack(
+        self.search_entry.pack(
             side="left",
-            fill="both",
-            expand=True,
-            padx=(20, 0),
-            pady=(0, 20)
-        )
-
-        scrollbar.pack(
-            side="right",
-            fill="y",
-            padx=(0, 16),
-            pady=(0, 20)
-        )
-
-    def set_status(self, text, color=MUTED):
-        self.status.config(
-            text=text,
-            fg=color
-        )
-
-    def set_filter(self, value):
-        self.current_filter = value
-        self.render_cards()
-
-    def refresh(self):
-        def worker():
-            try:
-                response = requests.get(
-                    f"{API_URL}/api/programs",
-                    timeout=30
-                )
-
-                response.raise_for_status()
-
-                data = response.json()
-
-                self.programs = data.get(
-                    "programs",
-                    []
-                )
-
-                self.root.after(
-                    0,
-                    self.render_cards
-                )
-
-                self.root.after(
-                    0,
-                    lambda: self.set_status(
-                        f"{len(self.programs)} Programme verfügbar",
-                        GREEN
-                    )
-                )
-
-            except Exception as exc:
-                self.root.after(
-                    0,
-                    lambda: self.set_status(
-                        f"Verbindungsfehler: {exc}",
-                        RED
-                    )
-                )
-
-        threading.Thread(
-            target=worker,
-            daemon=True
-        ).start()
-
-    def is_installed(self, program):
-        record = self.installed.get(
-            program["id"]
-        )
-
-        if not record:
-            return False
-
-        path = Path(
-            record.get("path", "")
-        )
-
-        return path.exists()
-
-    def is_update_available(self, program):
-        record = self.installed.get(
-            program["id"]
-        )
-
-        if not record:
-            return False
-
-        return (
-            record.get("version")
-            != program.get("version")
-        )
-
-    def render_cards(self):
-        for widget in self.cards_frame.winfo_children():
-            widget.destroy()
-
-        query = self.search_var.get().strip().lower()
-
-        visible = []
-
-        for program in self.programs:
-            installed = self.is_installed(program)
-
-            if (
-                self.current_filter == "Installiert"
-                and not installed
-            ):
-                continue
-
-            haystack = " ".join([
-                program.get("name", ""),
-                program.get("short_description", ""),
-                program.get("category", "")
-            ]).lower()
-
-            if (
-                query
-                and query != "programme suchen..."
-                and query not in haystack
-            ):
-                continue
-
-            visible.append(
-                (program, installed)
-            )
-
-        for program, installed in visible:
-            self.create_card(
-                program,
-                installed
-            )
-
-        if not visible:
-            tk.Label(
-                self.cards_frame,
-                text="Keine passenden Programme gefunden.",
-                bg=WINDOW_BG,
-                fg=MUTED,
-                font=("Segoe UI", 12)
-            ).pack(pady=40)
-
-    def create_card(self, program, installed):
-        card = tk.Frame(
-            self.cards_frame,
-            bg=CARD_BG,
-            padx=18,
-            pady=16
-        )
-
-        card.pack(
             fill="x",
-            padx=8,
-            pady=8
-        )
-
-        left = tk.Frame(
-            card,
-            bg=CARD_BG
-        )
-
-        left.pack(
-            side="left",
-            fill="both",
             expand=True
         )
 
-        tk.Label(
-            left,
-            text=program.get("name", program["id"]),
-            bg=CARD_BG,
-            fg=TEXT,
-            font=("Segoe UI", 15, "bold")
-        ).pack(anchor="w")
-
-        tk.Label(
-            left,
-            text=(
-                f'{program.get("category", "Sonstiges")} '
-                f'· Version {program.get("version", "?")}'
-            ),
-            bg=CARD_BG,
-            fg=MUTED,
-            font=("Segoe UI", 9)
-        ).pack(
-            anchor="w",
-            pady=(3, 8)
+        self.search_entry.bind(
+            "<KeyRelease>",
+            lambda _event: self.apply_filter()
         )
 
-        tk.Label(
-            left,
-            text=program.get("short_description", ""),
-            bg=CARD_BG,
-            fg=TEXT,
-            wraplength=650,
-            justify="left",
-            font=("Segoe UI", 10)
-        ).pack(anchor="w")
+        self.category_var = tk.StringVar(value="Alle Kategorien")
 
-        right = tk.Frame(
-            card,
-            bg=CARD_BG
+        self.category_box = ttk.Combobox(
+            toolbar,
+            textvariable=self.category_var,
+            state="readonly",
+            width=22
+        )
+
+        self.category_box.pack(
+            side="left",
+            padx=(10, 0)
+        )
+
+        self.category_box.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self.apply_filter()
+        )
+
+        ttk.Button(
+            toolbar,
+            text="Aktualisieren",
+            command=self.refresh_programs
+        ).pack(side="left", padx=(10, 0))
+
+        content = ttk.Frame(self.root, padding=(20, 0, 20, 10))
+        content.pack(fill="both", expand=True)
+
+        left = ttk.Frame(content)
+        left.pack(side="left", fill="both", expand=True)
+
+        right = ttk.Frame(
+            content,
+            padding=18
         )
 
         right.pack(
             side="right",
-            padx=(12, 0)
-        )
-
-        self.button(
-            right,
-            "Details",
-            lambda p=program: self.show_details(p),
-            "#33465f"
-        )
-
-        if installed:
-            if self.is_update_available(program):
-                self.button(
-                    right,
-                    "Update",
-                    lambda p=program: self.update_program(p),
-                    GOLD,
-                    "#202020"
-                )
-
-            self.button(
-                right,
-                "Starten",
-                lambda p=program: self.start_program(p),
-                ACCENT,
-                "#06202A"
-            )
-
-            self.button(
-                right,
-                "Deinstallieren",
-                lambda p=program: self.uninstall_program(p),
-                "#56313b"
-            )
-
-        else:
-            self.button(
-                right,
-                "Installieren",
-                lambda p=program: self.install_program(p),
-                GREEN,
-                "#07130b"
-            )
-
-    def button(
-        self,
-        parent,
-        text,
-        command,
-        background,
-        foreground="white"
-    ):
-        tk.Button(
-            parent,
-            text=text,
-            command=command,
-            bg=background,
-            fg=foreground,
-            activebackground=background,
-            relief="flat",
-            padx=15,
-            pady=8
-        ).pack(
-            pady=3,
-            fill="x"
-        )
-
-    def show_details(self, program):
-        win = tk.Toplevel(self.root)
-
-        win.title(
-            program.get("name", "Programm")
-        )
-
-        win.geometry("620x470")
-        win.configure(bg=WINDOW_BG)
-
-        tk.Label(
-            win,
-            text=program.get("name", ""),
-            bg=WINDOW_BG,
-            fg=TEXT,
-            font=("Segoe UI", 22, "bold")
-        ).pack(
-            anchor="w",
-            padx=24,
-            pady=(24, 6)
-        )
-
-        tk.Label(
-            win,
-            text=(
-                f'{program.get("category", "Sonstiges")} '
-                f'· Version {program.get("version", "?")}'
-            ),
-            bg=WINDOW_BG,
-            fg=MUTED
-        ).pack(
-            anchor="w",
-            padx=24
-        )
-
-        body = tk.Text(
-            win,
-            bg=PANEL_BG,
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="flat",
-            wrap="word",
-            font=("Segoe UI", 11)
-        )
-
-        body.pack(
             fill="both",
             expand=True,
-            padx=24,
-            pady=20
+            padx=(15, 0)
         )
 
-        body.insert(
-            "1.0",
-            program.get(
-                "description",
+        ttk.Label(
+            left,
+            text="VERFÜGBARE PROGRAMME",
+            font=("Segoe UI", 11, "bold")
+        ).pack(anchor="w", pady=(0, 10))
+
+        list_frame = tk.Frame(
+            left,
+            bg="#152238",
+            highlightbackground="#263b56",
+            highlightthickness=1
+        )
+
+        list_frame.pack(fill="both", expand=True)
+
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side="right", fill="y")
+
+        self.program_list = tk.Listbox(
+            list_frame,
+            bg="#152238",
+            fg="#e5eefb",
+            selectbackground="#17618a",
+            selectforeground="#ffffff",
+            font=("Segoe UI", 10),
+            relief="flat",
+            borderwidth=0,
+            activestyle="none",
+            yscrollcommand=scrollbar.set
+        )
+
+        self.program_list.pack(
+            side="left",
+            fill="both",
+            expand=True,
+            padx=8,
+            pady=8
+        )
+
+        scrollbar.config(
+            command=self.program_list.yview
+        )
+
+        self.program_list.bind(
+            "<<ListboxSelect>>",
+            self.on_select
+        )
+
+        ttk.Label(
+            right,
+            text="PROGRAMMDETAILS",
+            font=("Segoe UI", 11, "bold")
+        ).pack(anchor="w")
+
+        self.detail_name = tk.Label(
+            right,
+            text="Programm auswählen",
+            bg="#0b1220",
+            fg="#55d6ff",
+            font=("Segoe UI", 19, "bold"),
+            anchor="w",
+            justify="left",
+            wraplength=350
+        )
+
+        self.detail_name.pack(
+            fill="x",
+            pady=(20, 8)
+        )
+
+        self.detail_info = tk.Label(
+            right,
+            text="Wähle links ein Programm aus.",
+            bg="#0b1220",
+            fg="#a9bbd0",
+            font=("Segoe UI", 10),
+            anchor="nw",
+            justify="left",
+            wraplength=350
+        )
+
+        self.detail_info.pack(
+            fill="both",
+            expand=True,
+            anchor="nw"
+        )
+
+        button_frame = ttk.Frame(right)
+        button_frame.pack(fill="x", pady=(20, 0))
+
+        self.install_button = ttk.Button(
+            button_frame,
+            text="Installieren",
+            command=self.install_selected
+        )
+        self.install_button.pack(fill="x", pady=4)
+
+        self.start_button = ttk.Button(
+            button_frame,
+            text="Starten",
+            command=self.start_selected
+        )
+        self.start_button.pack(fill="x", pady=4)
+
+        self.update_button = ttk.Button(
+            button_frame,
+            text="Aktualisieren",
+            command=self.update_selected
+        )
+        self.update_button.pack(fill="x", pady=4)
+
+        self.uninstall_button = ttk.Button(
+            button_frame,
+            text="Deinstallieren",
+            command=self.uninstall_selected
+        )
+        self.uninstall_button.pack(fill="x", pady=4)
+
+        footer = ttk.Frame(self.root, padding=(20, 8, 20, 15))
+        footer.pack(fill="x")
+
+        self.status_label = ttk.Label(
+            footer,
+            text="Bereit",
+            style="Subtitle.TLabel"
+        )
+
+        self.status_label.pack(anchor="w")
+
+        self.update_buttons()
+
+    # --------------------------------------------------------
+    # PROGRAMME LADEN
+    # --------------------------------------------------------
+
+    def refresh_programs(self):
+        self.set_status("Lade Programme ...")
+        self.set_buttons_enabled(False)
+
+        def worker():
+            try:
+                programs = fetch_programs()
+
+                self.root.after(
+                    0,
+                    lambda: self.on_programs_loaded(programs)
+                )
+
+            except Exception as exc:
+                self.root.after(
+                    0,
+                    lambda error=str(exc): self.on_load_error(error)
+                )
+
+        threading.Thread(
+            target=worker,
+            daemon=True
+        ).start()
+
+    def on_programs_loaded(self, programs):
+        self.programs = programs
+
+        categories = sorted({
+            str(program.get("category", "Sonstiges"))
+            for program in programs
+        })
+
+        self.category_box["values"] = [
+            "Alle Kategorien"
+        ] + categories
+
+        self.category_var.set("Alle Kategorien")
+
+        self.apply_filter()
+        self.set_status(
+            f"{len(programs)} Programme geladen."
+        )
+
+        self.set_buttons_enabled(True)
+
+    def on_load_error(self, error):
+        self.set_status("Fehler beim Laden.")
+        self.set_buttons_enabled(True)
+
+        messagebox.showerror(
+            "Core Store",
+            f"Programme konnten nicht geladen werden:\n\n{error}"
+        )
+
+    # --------------------------------------------------------
+    # FILTER
+    # --------------------------------------------------------
+
+    def apply_filter(self):
+        search = self.search_var.get().strip().lower()
+        category = self.category_var.get()
+
+        self.filtered_programs = []
+
+        for program in self.programs:
+            name = str(program.get("name", "")).lower()
+            description = str(
                 program.get("short_description", "")
+            ).lower()
+
+            program_category = str(
+                program.get("category", "Sonstiges")
             )
-        )
 
-        body.config(state="disabled")
+            if search and search not in name and search not in description:
+                continue
 
-    def install_program(self, program):
-        if not messagebox.askyesno(
-            "Installieren",
-            f'{program["name"]} installieren?'
-        ):
+            if (
+                category != "Alle Kategorien"
+                and program_category != category
+            ):
+                continue
+
+            self.filtered_programs.append(program)
+
+        self.program_list.delete(0, tk.END)
+
+        for program in self.filtered_programs:
+            program_id = program.get("id", "")
+            name = program.get("name", program_id)
+
+            if program_id in self.installed:
+                name = f"[INSTALLIERT] {name}"
+
+            self.program_list.insert(tk.END, name)
+
+        self.selected_program = None
+        self.show_program_details(None)
+        self.update_buttons()
+
+    # --------------------------------------------------------
+    # AUSWAHL
+    # --------------------------------------------------------
+
+    def on_select(self, _event=None):
+        selection = self.program_list.curselection()
+
+        if not selection:
             return
 
-        self.set_status(
-            f'{program["name"]} wird installiert...',
-            ACCENT
+        index = selection[0]
+
+        if index >= len(self.filtered_programs):
+            return
+
+        self.selected_program = self.filtered_programs[index]
+
+        self.show_program_details(
+            self.selected_program
         )
 
+        self.update_buttons()
+
+    def show_program_details(self, program):
+        if not program:
+            self.detail_name.config(
+                text="Programm auswählen"
+            )
+
+            self.detail_info.config(
+                text="Wähle links ein Programm aus."
+            )
+
+            return
+
+        name = program.get("name", "Unbekannt")
+        version = program.get("version", "Unbekannt")
+        author = program.get("author", "Unbekannt")
+        category = program.get("category", "Sonstiges")
+
+        description = program.get(
+            "description",
+            program.get("short_description", "")
+        )
+
+        program_id = program.get("id", "")
+        installed = program_id in self.installed
+
+        status = (
+            "Installiert"
+            if installed
+            else "Nicht installiert"
+        )
+
+        files = program.get("files", {})
+
+        install_file = files.get("installation") or "Keine"
+        start_file = files.get("start") or "Keine"
+        uninstall_file = files.get("uninstallation") or "Keine"
+        update_file = files.get("update") or "Keine"
+
+        self.detail_name.config(text=name)
+
+        info = (
+            f"{description}\n\n"
+            f"Version: {version}\n"
+            f"Autor: {author}\n"
+            f"Kategorie: {category}\n"
+            f"Status: {status}\n\n"
+            f"INSTALLATION\n{install_file}\n\n"
+            f"START\n{start_file}\n\n"
+            f"DEINSTALLATION\n{uninstall_file}\n\n"
+            f"UPDATE\n{update_file}"
+        )
+
+        self.detail_info.config(text=info)
+
+    # --------------------------------------------------------
+    # BUTTONS
+    # --------------------------------------------------------
+
+    def update_buttons(self):
+        program = self.selected_program
+
+        if not program:
+            for button in (
+                self.install_button,
+                self.start_button,
+                self.update_button,
+                self.uninstall_button
+            ):
+                button.config(state="disabled")
+
+            return
+
+        program_id = program.get("id")
+        installed = program_id in self.installed
+
+        self.install_button.config(
+            state="disabled" if installed else "normal"
+        )
+
+        self.start_button.config(
+            state="normal" if installed else "disabled"
+        )
+
+        self.update_button.config(
+            state="normal" if installed else "disabled"
+        )
+
+        self.uninstall_button.config(
+            state="normal" if installed else "disabled"
+        )
+
+    def set_buttons_enabled(self, enabled):
+        state = "normal" if enabled else "disabled"
+
+        self.search_entry.config(state=state)
+        self.category_box.config(state="readonly" if enabled else "disabled")
+
+        self.program_list.config(
+            state=state
+        )
+
+        if not enabled:
+            for button in (
+                self.install_button,
+                self.start_button,
+                self.update_button,
+                self.uninstall_button
+            ):
+                button.config(state="disabled")
+        else:
+            self.update_buttons()
+
+    # --------------------------------------------------------
+    # HINTERGRUNDAUFGABEN
+    # --------------------------------------------------------
+
+    def run_background(self, label, function, success_message):
+        self.set_status(label)
+        self.set_buttons_enabled(False)
+
         def worker():
-            destination = None
-
             try:
-                LOCAL_ROOT.mkdir(
-                    parents=True,
-                    exist_ok=True
-                )
-
-                destination = safe_child(
-                    LOCAL_ROOT,
-                    program["folder"]
-                )
-
-                if destination.exists():
-                    raise ValueError(
-                        "Der Zielordner existiert bereits, "
-                        "ist aber nicht als Store-Installation registriert."
-                    )
-
-                with tempfile.TemporaryDirectory() as temp:
-                    temp = Path(temp)
-
-                    zip_path = temp / "program.zip"
-                    staging = temp / "extracted"
-
-                    download_program(
-                        program["id"],
-                        zip_path
-                    )
-
-                    staging.mkdir()
-
-                    extract_safely(
-                        zip_path,
-                        staging
-                    )
-
-                    if not any(staging.iterdir()):
-                        raise ValueError(
-                            "Das heruntergeladene Programm ist leer."
-                        )
-
-                    shutil.move(
-                        str(staging),
-                        str(destination)
-                    )
-
-                post_file = program.get(
-                    "post_install_file"
-                )
-
-                if post_file:
-                    result = launch_file(
-                        destination,
-                        post_file,
-                        wait=True
-                    )
-
-                    if result and result.returncode != 0:
-                        raise RuntimeError(
-                            "post_install_file wurde mit "
-                            f"Exit-Code {result.returncode} beendet."
-                        )
-
-                self.installed[program["id"]] = {
-                    "path": str(destination),
-                    "version": program.get("version", "1.0.0"),
-                    "folder": program["folder"]
-                }
-
-                save_installed(self.installed)
+                function()
 
                 self.root.after(
                     0,
-                    lambda: self.set_status(
-                        f'{program["name"]} wurde installiert.',
-                        GREEN
-                    )
-                )
-
-                self.root.after(
-                    0,
-                    self.render_cards
+                    lambda: self.action_finished(success_message)
                 )
 
             except Exception as exc:
                 self.root.after(
                     0,
-                    lambda: self.set_status(
-                        f"Installationsfehler: {exc}",
-                        RED
-                    )
-                )
-
-                self.root.after(
-                    0,
-                    lambda: messagebox.showerror(
-                        "Installationsfehler",
-                        str(exc)
-                    )
+                    lambda error=str(exc): self.action_failed(error)
                 )
 
         threading.Thread(
@@ -890,167 +1192,68 @@ class CoreStore:
             daemon=True
         ).start()
 
-    def update_program(self, program):
+    def action_finished(self, message):
+        self.installed = load_installed()
+
+        self.apply_filter()
+        self.set_buttons_enabled(True)
+
+        self.set_status(message)
+
+        messagebox.showinfo(
+            "Core Store",
+            message
+        )
+
+    def action_failed(self, error):
+        self.installed = load_installed()
+
+        self.apply_filter()
+        self.set_buttons_enabled(True)
+
+        self.set_status("Aktion fehlgeschlagen.")
+
+        messagebox.showerror(
+            "Core Store",
+            error
+        )
+
+    # --------------------------------------------------------
+    # INSTALLIEREN
+    # --------------------------------------------------------
+
+    def install_selected(self):
+        program = self.selected_program
+
+        if not program:
+            return
+
         if not messagebox.askyesno(
-            "Programm aktualisieren",
-            (
-                f'{program["name"]} aktualisieren?\n\n'
-                "Die in update_preserve angegebenen Dateien "
-                "und Ordner bleiben erhalten."
-            )
+            "Installation",
+            f"Möchtest du {program.get('name')} installieren?\n\n"
+            "Das Programm kann während der Installation lokale Skripte ausführen."
         ):
             return
 
-        self.set_status(
-            f'{program["name"]} wird aktualisiert...',
-            ACCENT
+        self.run_background(
+            "Installiere Programm ...",
+            lambda: install_program(program),
+            "Programm erfolgreich installiert."
         )
 
-        def worker():
-            try:
-                old_dir = safe_child(
-                    LOCAL_ROOT,
-                    program["folder"]
-                )
+    # --------------------------------------------------------
+    # STARTEN
+    # --------------------------------------------------------
 
-                if not old_dir.exists():
-                    raise FileNotFoundError(
-                        "Die bisherige Installation wurde nicht gefunden."
-                    )
+    def start_selected(self):
+        program = self.selected_program
 
-                with tempfile.TemporaryDirectory() as temp:
-                    temp = Path(temp)
+        if not program:
+            return
 
-                    zip_path = temp / "program.zip"
-                    staging = temp / "staging"
-
-                    staging.mkdir()
-
-                    download_program(
-                        program["id"],
-                        zip_path
-                    )
-
-                    extract_safely(
-                        zip_path,
-                        staging
-                    )
-
-                    preserve = program.get(
-                        "update_preserve",
-                        []
-                    )
-
-                    for entry in preserve:
-                        relative = safe_relative_path(entry)
-
-                        old_item = old_dir / relative
-                        new_item = staging / relative
-
-                        if old_item.is_dir():
-                            if new_item.exists():
-                                if new_item.is_dir():
-                                    shutil.rmtree(new_item)
-                                else:
-                                    new_item.unlink()
-
-                            shutil.copytree(
-                                old_item,
-                                new_item
-                            )
-
-                        elif old_item.is_file():
-                            new_item.parent.mkdir(
-                                parents=True,
-                                exist_ok=True
-                            )
-
-                            shutil.copy2(
-                                old_item,
-                                new_item
-                            )
-
-                    backup = LOCAL_ROOT / (
-                        "_backup_" + program["id"]
-                    )
-
-                    if backup.exists():
-                        shutil.rmtree(backup)
-
-                    old_dir.rename(backup)
-
-                    try:
-                        staging.rename(old_dir)
-
-                        self.installed[program["id"]] = {
-                            "path": str(old_dir),
-                            "version": program.get("version", "1.0.0"),
-                            "folder": program["folder"]
-                        }
-
-                        save_installed(self.installed)
-
-                    except Exception:
-                        if old_dir.exists():
-                            shutil.rmtree(old_dir)
-
-                        backup.rename(old_dir)
-                        raise
-
-                    if backup.exists():
-                        shutil.rmtree(backup)
-
-                self.root.after(
-                    0,
-                    lambda: self.set_status(
-                        f'{program["name"]} wurde aktualisiert.',
-                        GREEN
-                    )
-                )
-
-                self.root.after(
-                    0,
-                    self.render_cards
-                )
-
-            except Exception as exc:
-                self.root.after(
-                    0,
-                    lambda: self.set_status(
-                        f"Update fehlgeschlagen: {exc}",
-                        RED
-                    )
-                )
-
-                self.root.after(
-                    0,
-                    lambda: messagebox.showerror(
-                        "Update fehlgeschlagen",
-                        str(exc)
-                    )
-                )
-
-        threading.Thread(
-            target=worker,
-            daemon=True
-        ).start()
-
-    def start_program(self, program):
         try:
-            directory = safe_child(
-                LOCAL_ROOT,
-                program["folder"]
-            )
-
-            if not directory.exists():
-                raise FileNotFoundError(
-                    "Der lokale Programmordner wurde nicht gefunden."
-                )
-
-            launch_file(
-                directory,
-                program.get("start_file")
-            )
+            start_program(program)
+            self.set_status("Programm gestartet.")
 
         except Exception as exc:
             messagebox.showerror(
@@ -1058,59 +1261,85 @@ class CoreStore:
                 str(exc)
             )
 
-    def uninstall_program(self, program):
+    # --------------------------------------------------------
+    # UPDATE
+    # --------------------------------------------------------
+
+    def update_selected(self):
+        program = self.selected_program
+
+        if not program:
+            return
+
         if not messagebox.askyesno(
-            "Deinstallieren",
-            (
-                f'{program["name"]} und alle Dateien im '
-                "zugehörigen Programmordner löschen?\n\n"
-                "Es wird keine Datei ausgeführt."
-            )
+            "Update",
+            f"Möchtest du {program.get('name')} aktualisieren?\n\n"
+            "Die konfigurierten Daten und Ordner werden übernommen."
         ):
             return
 
-        try:
-            destination = safe_child(
-                LOCAL_ROOT,
-                program["folder"]
-            )
+        self.run_background(
+            "Aktualisiere Programm ...",
+            lambda: update_program(program),
+            "Programm erfolgreich aktualisiert."
+        )
 
-            if destination.exists():
-                shutil.rmtree(destination)
+    # --------------------------------------------------------
+    # DEINSTALLIEREN
+    # --------------------------------------------------------
 
-            self.installed.pop(
-                program["id"],
-                None
-            )
+    def uninstall_selected(self):
+        program = self.selected_program
 
-            save_installed(self.installed)
+        if not program:
+            return
 
-            self.set_status(
-                f'{program["name"]} wurde deinstalliert.',
-                GREEN
-            )
+        if not messagebox.askyesno(
+            "Deinstallation",
+            f"Möchtest du {program.get('name')} wirklich deinstallieren?\n\n"
+            "Die Programmdateien werden anschließend gelöscht."
+        ):
+            return
 
-            self.render_cards()
+        self.run_background(
+            "Deinstalliere Programm ...",
+            lambda: uninstall_program(program),
+            "Programm erfolgreich deinstalliert."
+        )
 
-        except Exception as exc:
-            messagebox.showerror(
-                "Deinstallationsfehler",
-                str(exc)
-            )
+    # --------------------------------------------------------
+    # STATUS
+    # --------------------------------------------------------
 
+    def set_status(self, text):
+        self.status_label.config(text=text)
+
+
+# ============================================================
+# START
+# ============================================================
 
 def main():
-    STORE_DATA.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
     root = tk.Tk()
-
     CoreStore(root)
-
     root.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+
+    except Exception as exc:
+        try:
+            root = tk.Tk()
+            root.withdraw()
+
+            messagebox.showerror(
+                "Core Store Startfehler",
+                str(exc)
+            )
+
+        except Exception:
+            print(exc)
+
+        sys.exit(1)
