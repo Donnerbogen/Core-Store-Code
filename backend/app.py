@@ -4,16 +4,16 @@ import json
 import os
 import re
 import zipfile
+from functools import lru_cache
 
 import requests
-from flask import Flask, jsonify, send_file
+from flask import Flask, jsonify, send_file, Response
 
 app = Flask(__name__)
 
 GITHUB_API = "https://api.github.com"
 
 TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
-CODE_REPO = os.environ.get("CODE_REPO", "").strip()
 FILES_REPO = os.environ.get("FILES_REPO", "").strip()
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip() or "main"
 CONFIG_PATH = os.environ.get(
@@ -21,7 +21,11 @@ CONFIG_PATH = os.environ.get(
     "config/programs.json"
 ).strip()
 
+MAX_FILE_SIZE = 25 * 1024 * 1024
+MAX_PROGRAM_SIZE = 150 * 1024 * 1024
+
 SESSION = requests.Session()
+
 SESSION.headers.update({
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28"
@@ -38,29 +42,31 @@ class StoreError(Exception):
 def check_settings():
     missing = []
 
-    for name, value in [
-        ("GITHUB_TOKEN", TOKEN),
-        ("CODE_REPO", CODE_REPO),
-        ("FILES_REPO", FILES_REPO)
-    ]:
-        if not value:
-            missing.append(name)
+    if not TOKEN:
+        missing.append("GITHUB_TOKEN")
+
+    if not FILES_REPO:
+        missing.append("FILES_REPO")
 
     if missing:
         raise StoreError(
-            "Render-Variablen fehlen: " + ", ".join(missing)
+            "Render-Umgebungsvariablen fehlen: "
+            + ", ".join(missing)
         )
 
 
-def repo_url(repo, suffix=""):
-    return f"{GITHUB_API}/repos/{repo}/{suffix}".rstrip("/")
+def repo_url(suffix=""):
+    return (
+        f"{GITHUB_API}/repos/"
+        f"{FILES_REPO}/{suffix}"
+    ).rstrip("/")
 
 
 def github_get(url, params=None):
     response = SESSION.get(
         url,
         params=params,
-        timeout=45
+        timeout=40
     )
 
     if response.status_code >= 400:
@@ -73,7 +79,7 @@ def github_get(url, params=None):
             detail = response.text
 
         raise StoreError(
-            f"GitHub-Fehler {response.status_code}: {detail}"
+            f"GitHub-Fehler ({response.status_code}): {detail}"
         )
 
     return response
@@ -81,16 +87,16 @@ def github_get(url, params=None):
 
 def safe_segment(value, label):
     if not isinstance(value, str):
-        raise StoreError(f"Ungültiger Wert: {label}")
+        raise StoreError(f"Ungültiger {label}.")
 
     if not value or value in (".", ".."):
-        raise StoreError(f"Ungültiger Wert: {label}")
+        raise StoreError(f"Ungültiger {label}.")
 
     if "/" in value or "\\" in value or "\x00" in value:
-        raise StoreError(f"Ungültiger Wert: {label}")
+        raise StoreError(f"Ungültiger {label}.")
 
     if not re.fullmatch(r"[A-Za-z0-9._ -]{1,80}", value):
-        raise StoreError(f"Ungültiger Wert: {label}")
+        raise StoreError(f"Ungültiger {label}.")
 
     return value
 
@@ -101,30 +107,22 @@ def safe_relative_path(value, label):
 
     value = value.replace("\\", "/")
 
-    if value.startswith("/"):
-        raise StoreError(f"Ungültiger Pfad: {label}")
-
-    if re.match(r"^[A-Za-z]:", value):
-        raise StoreError(f"Ungültiger Pfad: {label}")
-
     parts = value.split("/")
 
     if any(part in ("", ".", "..") for part in parts):
-        raise StoreError(f"Ungültiger Pfad: {label}")
+        raise StoreError(f"Ungültiger Pfad für {label}.")
+
+    if value.startswith("/") or re.match(r"^[A-Za-z]:", value):
+        raise StoreError(f"Ungültiger Pfad für {label}.")
 
     return "/".join(parts)
 
 
-def get_manifest():
-    check_settings()
-
-    url = repo_url(
-        CODE_REPO,
-        f"contents/{CONFIG_PATH}"
-    )
+def github_read_file(path):
+    path = safe_relative_path(path, "GitHub-Dateipfad")
 
     response = github_get(
-        url,
+        repo_url(f"contents/{path}"),
         {"ref": GITHUB_BRANCH}
     )
 
@@ -132,25 +130,28 @@ def get_manifest():
 
     if payload.get("type") != "file":
         raise StoreError(
-            "Die programs.json wurde nicht gefunden."
+            f"GitHub-Pfad ist keine Datei: {path}"
         )
 
-    raw = base64.b64decode(payload["content"])
+    if payload.get("encoding") != "base64":
+        raise StoreError(
+            f"Datei konnte nicht gelesen werden: {path}"
+        )
 
-    data = json.loads(
-        raw.decode("utf-8-sig")
-    )
+    return base64.b64decode(payload["content"])
 
+
+def validate_manifest(data):
     if not isinstance(data, dict):
         raise StoreError("Ungültige programs.json.")
 
     if not isinstance(data.get("programs"), list):
         raise StoreError(
-            "Die programs.json benötigt eine programs-Liste."
+            "programs.json muss eine programs-Liste enthalten."
         )
 
-    result = []
     seen = set()
+    cleaned = []
 
     for item in data["programs"]:
         if not isinstance(item, dict):
@@ -173,9 +174,24 @@ def get_manifest():
 
         seen.add(pid)
 
+        name = str(item.get("name", pid))[:100]
+        short_desc = str(
+            item.get("short_description", "")
+        )[:240]
+
+        description = str(
+            item.get("description", "")
+        )[:5000]
+
+        version = str(
+            item.get("version", "1.0.0")
+        )[:40]
+
+        category = str(
+            item.get("category", "Sonstiges")
+        )[:60]
+
         start_file = item.get("start_file")
-        post_install_file = item.get("post_install_file")
-        icon = item.get("icon")
 
         if start_file is not None:
             start_file = safe_relative_path(
@@ -183,11 +199,17 @@ def get_manifest():
                 "start_file"
             )
 
+        post_install_file = item.get(
+            "post_install_file"
+        )
+
         if post_install_file is not None:
             post_install_file = safe_relative_path(
                 post_install_file,
                 "post_install_file"
             )
+
+        icon = item.get("icon")
 
         if icon is not None:
             icon = safe_relative_path(
@@ -195,7 +217,10 @@ def get_manifest():
                 "icon"
             )
 
-        preserve = item.get("update_preserve", [])
+        preserve = item.get(
+            "update_preserve",
+            []
+        )
 
         if not isinstance(preserve, list):
             raise StoreError(
@@ -204,29 +229,21 @@ def get_manifest():
 
         clean_preserve = []
 
-        for entry in preserve:
+        for path in preserve:
             clean_preserve.append(
                 safe_relative_path(
-                    entry,
+                    path,
                     "update_preserve"
                 )
             )
 
-        result.append({
+        cleaned.append({
             "id": pid,
-            "name": str(item.get("name", pid))[:100],
-            "short_description": str(
-                item.get("short_description", "")
-            )[:240],
-            "description": str(
-                item.get("description", "")
-            )[:5000],
-            "version": str(
-                item.get("version", "1.0.0")
-            )[:40],
-            "category": str(
-                item.get("category", "Sonstiges")
-            )[:60],
+            "name": name,
+            "short_description": short_desc,
+            "description": description,
+            "version": version,
+            "category": category,
             "folder": folder,
             "start_file": start_file,
             "post_install_file": post_install_file,
@@ -234,7 +251,30 @@ def get_manifest():
             "update_preserve": clean_preserve
         })
 
-    return result
+    return cleaned
+
+
+@lru_cache(maxsize=1)
+def get_manifest_cached():
+    check_settings()
+
+    raw = github_read_file(CONFIG_PATH)
+
+    try:
+        data = json.loads(
+            raw.decode("utf-8-sig")
+        )
+    except Exception as exc:
+        raise StoreError(
+            f"programs.json ist ungültig: {exc}"
+        )
+
+    return validate_manifest(data)
+
+
+def get_manifest():
+    get_manifest_cached.cache_clear()
+    return get_manifest_cached()
 
 
 def get_program(program_id):
@@ -248,20 +288,16 @@ def get_program(program_id):
 def get_repo_tree():
     check_settings()
 
-    branch = github_get(
-        repo_url(
-            FILES_REPO,
-            f"branches/{GITHUB_BRANCH}"
-        )
+    branch_data = github_get(
+        repo_url(f"branches/{GITHUB_BRANCH}")
     ).json()
 
-    tree_sha = branch["commit"]["commit"]["tree"]["sha"]
+    tree_sha = (
+        branch_data["commit"]["commit"]["tree"]["sha"]
+    )
 
     response = github_get(
-        repo_url(
-            FILES_REPO,
-            f"git/trees/{tree_sha}"
-        ),
+        repo_url(f"git/trees/{tree_sha}"),
         {"recursive": "1"}
     )
 
@@ -269,7 +305,8 @@ def get_repo_tree():
 
     if data.get("truncated"):
         raise StoreError(
-            "Das Dateien-Repository ist zu groß."
+            "Das Dateien-Repository ist zu groß "
+            "für eine vollständige Git-Tree-Abfrage."
         )
 
     return data.get("tree", [])
@@ -282,9 +319,12 @@ def build_program_zip(program):
     tree = get_repo_tree()
 
     matching = [
-        node for node in tree
-        if node.get("type") == "blob"
-        and node.get("path", "").startswith(prefix)
+        node
+        for node in tree
+        if (
+            node.get("type") == "blob"
+            and node.get("path", "").startswith(prefix)
+        )
     ]
 
     if not matching:
@@ -294,9 +334,6 @@ def build_program_zip(program):
 
     output = io.BytesIO()
     total_bytes = 0
-
-    max_total = 150 * 1024 * 1024
-    max_file = 25 * 1024 * 1024
 
     with zipfile.ZipFile(
         output,
@@ -310,33 +347,31 @@ def build_program_zip(program):
 
             safe_relative_path(
                 relative,
-                "Programmdatei"
+                "Dateipfad im Programmordner"
             )
 
             size = node.get("size", 0)
 
-            if size > max_file:
+            if size > MAX_FILE_SIZE:
                 raise StoreError(
-                    f"Datei zu groß: {relative}"
+                    f"Einzeldatei ist größer als 25 MB: {relative}"
                 )
 
             total_bytes += size
 
-            if total_bytes > max_total:
+            if total_bytes > MAX_PROGRAM_SIZE:
                 raise StoreError(
-                    "Programm überschreitet 150 MB."
+                    "Programm überschreitet das Downloadlimit "
+                    "von 150 MB."
                 )
 
             blob = github_get(
-                repo_url(
-                    FILES_REPO,
-                    f"git/blobs/{node['sha']}"
-                )
+                repo_url(f"git/blobs/{node['sha']}")
             ).json()
 
             if blob.get("encoding") != "base64":
                 raise StoreError(
-                    f"Datei nicht lesbar: {relative}"
+                    f"Datei konnte nicht gelesen werden: {relative}"
                 )
 
             content = base64.b64decode(
@@ -356,7 +391,7 @@ def build_program_zip(program):
 @app.get("/")
 def index():
     return jsonify({
-        "name": "Core Network Store",
+        "name": "Core Store API",
         "status": "online",
         "api": "/api/programs"
     })
@@ -386,6 +421,7 @@ def programs():
 def download_program(program_id):
     try:
         program = get_program(program_id)
+
         archive = build_program_zip(program)
 
         return send_file(
@@ -393,6 +429,52 @@ def download_program(program_id):
             mimetype="application/zip",
             as_attachment=True,
             download_name=f"{program['id']}.zip"
+        )
+
+    except Exception as exc:
+        return jsonify({
+            "error": str(exc)
+        }), 400
+
+
+@app.get("/api/programs/<program_id>/icon")
+def program_icon(program_id):
+    try:
+        program = get_program(program_id)
+
+        icon = program.get("icon")
+
+        if not icon:
+            return jsonify({
+                "error": "Kein Icon konfiguriert."
+            }), 404
+
+        path = safe_relative_path(
+            icon,
+            "icon"
+        )
+
+        full_path = (
+            f"programs/{program['folder']}/{path}"
+        )
+
+        response = github_get(
+            repo_url(f"contents/{full_path}"),
+            {"ref": GITHUB_BRANCH}
+        )
+
+        payload = response.json()
+
+        content = base64.b64decode(
+            payload["content"]
+        )
+
+        return Response(
+            content,
+            mimetype=payload.get(
+                "content_type",
+                "application/octet-stream"
+            )
         )
 
     except Exception as exc:
