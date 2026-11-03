@@ -15,7 +15,7 @@ from pathlib import Path
 
 ALLOWED_FILES = {
     "main.py",
-    "start_core_store.bat",
+    "Core-Store.bat",
     "requirements.txt"
 }
 
