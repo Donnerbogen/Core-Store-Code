@@ -1,9 +1,9 @@
 import os
 import re
+import io
 import json
 import base64
 import zipfile
-import io
 
 import requests
 
@@ -13,44 +13,56 @@ from flask import Flask, jsonify, send_file
 app = Flask(__name__)
 
 # ============================================================
-# EINSTELLUNGEN
+# KONFIGURATION
 # ============================================================
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 FILES_REPO = os.getenv("FILES_REPO", "")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config/programs.json")
+STORE_CONFIG_PATH = "config/store.json"
 
 GITHUB_API = "https://api.github.com"
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
-MAX_PROGRAM_SIZE = 150 * 1024 * 1024
+MAX_ARCHIVE_SIZE = 150 * 1024 * 1024
 
 session = requests.Session()
 session.headers.update({
     "Authorization": f"Bearer {GITHUB_TOKEN}",
     "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
+    "X-GitHub-Api-Version": "2022-11-28"
 })
 
 
 # ============================================================
-# HILFSFUNKTIONEN
+# GITHUB
 # ============================================================
 
-def validate_environment():
+def check_environment():
     if not GITHUB_TOKEN:
-        raise RuntimeError("GITHUB_TOKEN fehlt auf Render.")
+        raise RuntimeError("GITHUB_TOKEN fehlt.")
 
     if not FILES_REPO or "/" not in FILES_REPO:
         raise RuntimeError(
-            "FILES_REPO muss im Format OWNER/REPOSITORY angegeben werden."
+            "FILES_REPO muss OWNER/REPOSITORY sein."
         )
 
 
-def github_request(url, params=None):
-    validate_environment()
+def repo_url(path=""):
+    check_environment()
 
+    owner, repository = FILES_REPO.split("/", 1)
+
+    if path:
+        return (
+            f"{GITHUB_API}/repos/{owner}/{repository}/{path}"
+        )
+
+    return f"{GITHUB_API}/repos/{owner}/{repository}"
+
+
+def github_get(url, params=None):
     response = session.get(
         url,
         params=params,
@@ -58,31 +70,20 @@ def github_request(url, params=None):
     )
 
     if response.status_code == 404:
-        raise FileNotFoundError("Die angeforderte GitHub-Datei wurde nicht gefunden.")
+        raise FileNotFoundError(
+            "Datei oder Repository auf GitHub nicht gefunden."
+        )
 
     if response.status_code == 403:
         raise PermissionError(
-            "GitHub-Zugriff verweigert. Prüfe die Token-Berechtigungen."
+            "GitHub-Zugriff verweigert. Token-Berechtigungen prüfen."
         )
 
     response.raise_for_status()
     return response
 
 
-def repository_url(path=""):
-    owner, repo = FILES_REPO.split("/", 1)
-
-    if path:
-        return f"{GITHUB_API}/repos/{owner}/{repo}/{path}"
-
-    return f"{GITHUB_API}/repos/{owner}/{repo}"
-
-
 def safe_repo_path(path):
-    """
-    Prüft einen Pfad, der innerhalb des GitHub-Repositories liegt.
-    """
-
     if not isinstance(path, str) or not path:
         raise ValueError("Ungültiger Repository-Pfad.")
 
@@ -99,50 +100,39 @@ def safe_repo_path(path):
     return "/".join(parts)
 
 
-def get_file_from_github(path):
+def get_file(path):
     path = safe_repo_path(path)
 
-    response = github_request(
-        repository_url(f"contents/{path}"),
+    response = github_get(
+        repo_url("contents/" + path),
         params={"ref": GITHUB_BRANCH}
     )
 
     data = response.json()
 
     if data.get("type") != "file":
-        raise ValueError("Der angegebene GitHub-Pfad ist keine Datei.")
+        raise ValueError("GitHub-Pfad ist keine Datei.")
 
     if data.get("encoding") != "base64":
         raise ValueError("Unbekanntes GitHub-Dateiformat.")
 
-    content = base64.b64decode(data["content"])
-    return content
+    return base64.b64decode(data["content"])
+
+
+def get_json(path):
+    content = get_file(path)
+
+    try:
+        return json.loads(content.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(
+            f"JSON-Datei {path} ist ungültig: {exc}"
+        )
 
 
 # ============================================================
 # PROGRAMMKONFIGURATION
 # ============================================================
-
-def get_program_config():
-    raw = get_file_from_github(CONFIG_PATH)
-
-    try:
-        config = json.loads(raw.decode("utf-8"))
-    except Exception as exc:
-        raise ValueError(
-            f"programs.json konnte nicht gelesen werden: {exc}"
-        )
-
-    if not isinstance(config, dict):
-        raise ValueError("Die Konfiguration muss ein JSON-Objekt sein.")
-
-    programs = config.get("programs")
-
-    if not isinstance(programs, list):
-        raise ValueError("In programs.json fehlt die Liste 'programs'.")
-
-    return config
-
 
 def validate_program(program):
     if not isinstance(program, dict):
@@ -160,7 +150,7 @@ def validate_program(program):
 
     if "/" in folder:
         raise ValueError(
-            "Der Programmordner muss direkt unter programs/ liegen."
+            "Programmordner muss direkt unter programs/ liegen."
         )
 
     program["folder"] = folder
@@ -168,7 +158,7 @@ def validate_program(program):
     files = program.get("files", {})
 
     if not isinstance(files, dict):
-        raise ValueError(f"Ungültige Dateikonfiguration für {program_id}.")
+        raise ValueError("Ungültige files-Konfiguration.")
 
     for key in (
         "installation",
@@ -178,7 +168,7 @@ def validate_program(program):
     ):
         value = files.get(key)
 
-        if value is not None and value != "":
+        if value:
             files[key] = safe_repo_path(value)
 
     program["files"] = files
@@ -186,7 +176,7 @@ def validate_program(program):
     execution = program.get("execution", {})
 
     if not isinstance(execution, dict):
-        raise ValueError(f"Ungültige Ausführungseinstellungen für {program_id}.")
+        raise ValueError("Ungültige execution-Konfiguration.")
 
     program["execution"] = execution
 
@@ -202,15 +192,27 @@ def validate_program(program):
     return program
 
 
-def get_program(program_id):
-    config = get_program_config()
+def get_programs_config():
+    config = get_json(CONFIG_PATH)
 
-    for program in config["programs"]:
-        if program.get("id") == program_id:
-            program = validate_program(program)
+    if not isinstance(config, dict):
+        raise ValueError("Ungültige programs.json.")
+
+    if not isinstance(config.get("programs"), list):
+        raise ValueError("Die Programmliste fehlt.")
+
+    return config
+
+
+def get_program(program_id):
+    config = get_programs_config()
+
+    for original in config["programs"]:
+        if original.get("id") == program_id:
+            program = validate_program(dict(original))
 
             if not program.get("enabled", True):
-                raise PermissionError("Dieses Programm ist deaktiviert.")
+                raise PermissionError("Programm ist deaktiviert.")
 
             return program
 
@@ -218,45 +220,46 @@ def get_program(program_id):
 
 
 # ============================================================
-# GITHUB PROGRAMM-DOWNLOAD
+# GITHUB TREE
 # ============================================================
 
-def get_branch_tree():
-    branch_response = github_request(
-        repository_url(f"branches/{GITHUB_BRANCH}")
-    )
+def get_repository_tree():
+    branch = github_get(
+        repo_url("branches/" + GITHUB_BRANCH)
+    ).json()
 
-    branch_data = branch_response.json()
-    commit_sha = branch_data["commit"]["sha"]
+    commit_sha = branch["commit"]["sha"]
 
-    commit_response = github_request(
-        repository_url(f"git/commits/{commit_sha}")
-    )
+    commit = github_get(
+        repo_url("git/commits/" + commit_sha)
+    ).json()
 
-    tree_sha = commit_response.json()["tree"]["sha"]
+    tree_sha = commit["tree"]["sha"]
 
-    tree_response = github_request(
-        repository_url(f"git/trees/{tree_sha}"),
+    tree = github_get(
+        repo_url("git/trees/" + tree_sha),
         params={"recursive": "1"}
-    )
+    ).json()
 
-    tree_data = tree_response.json()
-
-    if tree_data.get("truncated"):
+    if tree.get("truncated"):
         raise RuntimeError(
-            "Das GitHub-Repository ist zu groß für eine vollständige Dateiliste."
+            "GitHub-Dateiliste ist zu groß."
         )
 
-    return tree_data.get("tree", [])
+    return tree.get("tree", [])
 
 
-def create_program_zip(program):
-    folder = program["folder"]
-    prefix = f"programs/{folder}/"
+# ============================================================
+# ZIP AUS REPOSITORY-ORDNER ERSTELLEN
+# ============================================================
 
-    tree = get_branch_tree()
+def create_folder_zip(folder):
+    folder = safe_repo_path(folder)
+    prefix = folder.rstrip("/") + "/"
 
-    selected_files = []
+    tree = get_repository_tree()
+
+    selected = []
 
     for item in tree:
         path = item.get("path", "")
@@ -267,14 +270,13 @@ def create_program_zip(program):
         if item.get("type") != "blob":
             continue
 
-        # Symlinks nicht übernehmen.
         if item.get("mode") == "120000":
             continue
 
-        relative_path = path[len(prefix):]
+        relative = path[len(prefix):]
 
         try:
-            relative_path = safe_repo_path(relative_path)
+            relative = safe_repo_path(relative)
         except ValueError:
             continue
 
@@ -282,52 +284,85 @@ def create_program_zip(program):
 
         if size > MAX_FILE_SIZE:
             raise ValueError(
-                f"Datei überschreitet das Limit von 25 MB: {relative_path}"
+                f"Datei zu groß: {relative}"
             )
 
-        selected_files.append((relative_path, item["sha"], size))
+        selected.append({
+            "relative": relative,
+            "sha": item["sha"],
+            "size": size
+        })
 
-    if not selected_files:
+    if not selected:
         raise FileNotFoundError(
-            f"Keine Dateien im Ordner programs/{folder} gefunden."
+            f"Keine Dateien in {folder} gefunden."
         )
 
-    total_size = sum(item[2] for item in selected_files)
+    total = sum(item["size"] for item in selected)
 
-    if total_size > MAX_PROGRAM_SIZE:
-        raise ValueError("Das Programm überschreitet das Downloadlimit von 150 MB.")
+    if total > MAX_ARCHIVE_SIZE:
+        raise ValueError("ZIP-Archiv überschreitet 150 MB.")
 
-    archive_buffer = io.BytesIO()
+    output = io.BytesIO()
 
     with zipfile.ZipFile(
-        archive_buffer,
+        output,
         "w",
         compression=zipfile.ZIP_DEFLATED
     ) as archive:
 
-        for relative_path, blob_sha, expected_size in selected_files:
-            blob_response = github_request(
-                repository_url(f"git/blobs/{blob_sha}")
-            )
-
-            blob = blob_response.json()
+        for item in selected:
+            blob = github_get(
+                repo_url("git/blobs/" + item["sha"])
+            ).json()
 
             if blob.get("encoding") != "base64":
-                raise ValueError(f"Ungültiges Dateiformat: {relative_path}")
+                raise ValueError(
+                    "Ungültiges GitHub-Dateiformat."
+                )
 
             content = base64.b64decode(blob["content"])
 
-            if len(content) != expected_size:
-                raise ValueError(f"Dateigröße stimmt nicht: {relative_path}")
+            if len(content) != item["size"]:
+                raise ValueError(
+                    "Dateigröße stimmt nicht überein."
+                )
 
-            archive.writestr(relative_path, content)
+            archive.writestr(
+                item["relative"],
+                content
+            )
 
-    archive_buffer.seek(0)
-    return archive_buffer
+    output.seek(0)
+    return output
 
 
 # ============================================================
-# API ROUTES
+# STORE-KONFIGURATION
+# ============================================================
+
+def get_store_config():
+    config = get_json(STORE_CONFIG_PATH)
+
+    if not isinstance(config, dict):
+        raise ValueError("Ungültige store.json.")
+
+    version = config.get("version")
+
+    if not isinstance(version, str):
+        raise ValueError("Store-Version fehlt.")
+
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise ValueError("Ungültiges Store-Versionsformat.")
+
+    if config.get("folder") != "core-store":
+        raise ValueError("Ungültiger Store-Ordner.")
+
+    return config
+
+
+# ============================================================
+# API
 # ============================================================
 
 @app.route("/", methods=["GET"])
@@ -345,11 +380,14 @@ def health():
     })
 
 
+# ------------------------------------------------------------
+# PROGRAMME
+# ------------------------------------------------------------
+
 @app.route("/api/programs", methods=["GET"])
 def programs():
     try:
-        config = get_program_config()
-
+        config = get_programs_config()
         result = []
 
         for original in config["programs"]:
@@ -360,7 +398,6 @@ def programs():
                     result.append(program)
 
             except Exception:
-                # Ungültige Programme nicht an den Client ausliefern.
                 continue
 
         return jsonify({
@@ -373,17 +410,23 @@ def programs():
         }), 500
 
 
-@app.route("/api/programs/<program_id>/download", methods=["GET"])
+@app.route(
+    "/api/programs/<program_id>/download",
+    methods=["GET"]
+)
 def download_program(program_id):
     try:
         program = get_program(program_id)
-        archive = create_program_zip(program)
+
+        archive = create_folder_zip(
+            "programs/" + program["folder"]
+        )
 
         return send_file(
             archive,
             mimetype="application/zip",
             as_attachment=True,
-            download_name=f"{program_id}.zip"
+            download_name=program_id + ".zip"
         )
 
     except FileNotFoundError as exc:
@@ -396,8 +439,54 @@ def download_program(program_id):
         return jsonify({"error": str(exc)}), 500
 
 
+# ------------------------------------------------------------
+# CORE STORE VERSION
+# ------------------------------------------------------------
+
+@app.route("/api/store/version", methods=["GET"])
+def store_version():
+    try:
+        config = get_store_config()
+
+        return jsonify({
+            "enabled": bool(config.get("enabled", True)),
+            "version": config["version"],
+            "release_notes": config.get("release_notes", [])
+        })
+
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+# ------------------------------------------------------------
+# CORE STORE DOWNLOAD
+# ------------------------------------------------------------
+
+@app.route("/api/store/download", methods=["GET"])
+def store_download():
+    try:
+        config = get_store_config()
+
+        if not config.get("enabled", True):
+            return jsonify({
+                "error": "Store-Updates sind deaktiviert."
+            }), 403
+
+        archive = create_folder_zip("core-store")
+
+        return send_file(
+            archive,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name="core-store-update.zip"
+        )
+
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 # ============================================================
-# FEHLERBEHANDLUNG
+# FEHLER
 # ============================================================
 
 @app.errorhandler(404)
@@ -405,13 +494,6 @@ def not_found(_error):
     return jsonify({
         "error": "API-Endpunkt nicht gefunden."
     }), 404
-
-
-@app.errorhandler(500)
-def server_error(_error):
-    return jsonify({
-        "error": "Interner Serverfehler."
-    }), 500
 
 
 if __name__ == "__main__":
