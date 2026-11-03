@@ -1,34 +1,24 @@
 @echo off
-title Core Network Store
-color 0B
+title Core Store
 
 cd /d "%~dp0"
 
 echo ==========================================
-echo          CORE NETWORK STORE
+echo              CORE STORE
 echo ==========================================
 echo.
 
-where py >nul 2>&1
+where py >nul 2>nul
 
 if errorlevel 1 (
     echo Python wurde nicht gefunden.
-    echo Bitte installiere Python.
+    echo Bitte installiere Python 3.
     pause
     exit /b 1
 )
 
-echo Python wird geprueft...
-py -3 --version
+echo Pruefe Abhaengigkeiten...
 
-if errorlevel 1 (
-    echo Python konnte nicht gestartet werden.
-    pause
-    exit /b 1
-)
-
-echo.
-echo Abhaengigkeiten werden installiert...
 py -3 -m pip install -r requirements.txt
 
 if errorlevel 1 (
@@ -39,15 +29,12 @@ if errorlevel 1 (
 )
 
 echo.
-echo Core Store wird gestartet...
-echo.
+echo Starte Core Store...
 
 py -3 main.py
 
 if errorlevel 1 (
     echo.
-    echo Core Store konnte nicht gestartet werden.
+    echo Core Store wurde mit einem Fehler beendet.
     pause
 )
-
-exit /b
