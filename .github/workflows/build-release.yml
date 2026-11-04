@@ -1,0 +1,35 @@
+name: Build Core Store Windows Installer
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Node.js einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Electron-Abhaengigkeiten installieren
+        run: npm install
+        working-directory: desktop
+
+      - name: Windows-Installer bauen
+        run: npm run dist
+        working-directory: desktop
+
+      - name: Setup-Datei an GitHub Release anhaengen
+        uses: softprops/action-gh-release@v2
+        with:
+          files: desktop/dist/Core-Store-Setup.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
