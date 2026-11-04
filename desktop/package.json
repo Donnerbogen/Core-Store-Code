@@ -1,0 +1,52 @@
+{
+  "name": "core-store-desktop",
+  "version": "1.0.0",
+  "description": "Core Network Software Store",
+  "main": "main.js",
+  "author": "Core Network",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16"
+  },
+  "devDependencies": {
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "network.core.store",
+    "productName": "Core Store",
+    "asar": false,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json",
+      "settings.json",
+      "renderer/**/*",
+      "node_modules/**/*",
+      "!node_modules/electron-builder/**/*",
+      "!node_modules/electron/**/*"
+    ],
+    "win": {
+      "target": ["nsis"],
+      "artifactName": "Core-Store-Setup.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": false,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Core Store",
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}
