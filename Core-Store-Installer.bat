@@ -7,7 +7,7 @@ echo          CORE STORE INSTALLER
 echo ==========================================
 echo.
 echo Gib den Link zu deiner OEFFENTLICHEN GitHub-Haupt-Repository ein.
-echo Beispiel: https://github.com/OWNER/Core-Store-Code
+echo Beispiel: https://github.com/Donnerbogen/Core-Store-Code
 echo.
 set /p CORE_REPO=GitHub-Link: 
 if "%CORE_REPO%"=="" (
