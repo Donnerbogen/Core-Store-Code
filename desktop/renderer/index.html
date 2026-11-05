@@ -94,6 +94,30 @@
   <div class="modal-backdrop hidden" id="confirmBackdrop">
     <div class="confirm-modal"><div class="modal-mark">!</div><h3 id="confirmTitle">Aktion bestätigen</h3><p id="confirmText">Möchtest du fortfahren?</p><div class="modal-actions"><button class="secondary-button" id="confirmCancel">Abbrechen</button><button class="danger-button" id="confirmAccept">Bestätigen</button></div></div>
   </div>
+  <div class="modal-backdrop hidden" id="updateFailureBackdrop">
+    <div class="confirm-modal update-failure-modal">
+      <div class="modal-mark">!</div>
+      <h3>Core-Store-Update fehlgeschlagen</h3>
+      <p id="updateFailureCode" class="error-code">Fehlercode: CSU-999</p>
+      <p id="updateFailureText">Das Update konnte nicht abgeschlossen werden. Bitte melde dich über die Core-Network-Webseite.</p>
+      <p><a href="update-error-codes.html" target="_blank" rel="noreferrer">Fehlercode-Liste und Erklärungen öffnen</a></p>
+      <p id="updateFailureRestoreText" class="restore-status"></p>
+      <div class="modal-actions">
+        <button class="secondary-button" id="openSupportWebsite">Webseite öffnen</button>
+        <button class="primary-button" id="finishUpdateFailure">Abschließen</button>
+      </div>
+    </div>
+  </div>
+  <div class="modal-backdrop hidden" id="restoreNoticeBackdrop">
+    <div class="confirm-modal">
+      <div class="modal-mark restore-mark">✓</div>
+      <h3>Wiederherstellung</h3>
+      <p id="restoreNoticeText">Die ursprünglichen Dateien wurden aus dem Backup wiederhergestellt.</p>
+      <div class="modal-actions">
+        <button class="primary-button" id="closeRestoreNotice">Schließen</button>
+      </div>
+    </div>
+  </div>
   <script src="app.js"></script>
 </body>
 </html>
