@@ -1,6 +1,6 @@
 {
   "name": "core-store-desktop",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Core Network Software Store",
   "main": "main.js",
   "author": "Core Network",
@@ -35,7 +35,9 @@
       "!node_modules/electron/**/*"
     ],
     "win": {
-      "target": ["nsis"],
+      "target": [
+        "nsis"
+      ],
       "artifactName": "Core-Store-Setup.exe"
     },
     "nsis": {
