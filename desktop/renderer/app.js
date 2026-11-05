@@ -161,6 +161,43 @@ async function refreshStoreVersion() {
   }
 }
 
+async function showPendingUpdateFailure() {
+  try {
+    const failure = await window.coreStore.getUpdateFailure();
+    if (!failure) return;
+    const versionText = failure.failedVersion ? ` (Version ${failure.failedVersion})` : '';
+    const code = failure.errorCode || 'CSU-999';
+    const reason = failure.error ? `
+
+Details: ${failure.error}` : '';
+    $('#updateFailureCode').textContent = `Fehlercode: ${code}`;
+    $('#updateFailureText').textContent = `Das Core-Store-Update${versionText} ist fehlgeschlagen. Bitte melde dich über die Core-Network-Webseite und nenne den Fehlercode ${code}.${reason}`;
+    $('#updateFailureRestoreText').textContent = failure.restoreStatus === 'not-needed'
+      ? 'Die ursprünglichen Dateien wurden nicht verändert. Eine Wiederherstellung war nicht erforderlich.'
+      : failure.restored
+        ? 'Die ursprünglichen Dateien wurden automatisch aus dem Backup wiederhergestellt.'
+        : `Die automatische Wiederherstellung war nicht erfolgreich. ${failure.restoreError || 'Bitte wende dich an die Support-Webseite.'}`;
+    $('#updateFailureBackdrop').classList.remove('hidden');
+  } catch (error) {
+    console.error('Update-Fehlerstatus konnte nicht geladen werden:', error);
+  }
+}
+
+async function finishUpdateFailure() {
+  try {
+    const result = await window.coreStore.acknowledgeUpdateFailure();
+    $('#updateFailureBackdrop').classList.add('hidden');
+    $('#restoreNoticeText').textContent = result.restoreStatus === 'not-needed'
+      ? `Die ursprünglichen Dateien wurden nicht verändert. Eine Wiederherstellung war nicht erforderlich. (Fehlercode: ${result.errorCode || 'CSU-999'})`
+      : result.restored
+        ? `Die ursprünglichen Dateien wurden aus dem Backup wiederhergestellt. Der Core Store kann weiter verwendet werden. (Fehlercode: ${result.errorCode || 'CSU-999'})`
+        : `Die Wiederherstellung aus dem Backup konnte nicht bestätigt werden. Bitte melde dich beim Support und nenne den Fehlercode ${result.errorCode || 'CSU-999'}.`;
+    $('#restoreNoticeBackdrop').classList.remove('hidden');
+  } catch (error) {
+    toast(error.message || String(error), 'error');
+  }
+}
+
 function askConfirmation(title, message) {
   return new Promise(resolve => {
     $('#confirmTitle').textContent = title;
@@ -218,7 +255,7 @@ async function handleProgramAction(action, id) {
 
 async function applyStoreUpdate() {
   try {
-    const info = await window.coreStore.checkStoreUpdate();
+    const info = await window.coreStore.checkStoreUpdateForAction();
     if (!info.available) {
       toast('Der Core Store ist bereits aktuell.');
       return;
@@ -229,6 +266,8 @@ async function applyStoreUpdate() {
     await window.coreStore.applyStoreUpdate();
   } catch (error) {
     toast(error.message, 'error');
+    // Fehler, die vor dem Neustart auftreten, direkt in derselben Sitzung anzeigen.
+    await showPendingUpdateFailure();
   } finally {
     setBusy(false);
   }
@@ -259,6 +298,15 @@ function bindEvents() {
       toast('Der Core Store ist auf dem neuesten Stand.');
     }
   });
+  $('#openSupportWebsite').addEventListener('click', async () => {
+    try {
+      await window.coreStore.openSupportWebsite();
+    } catch (error) {
+      toast(error.message || String(error), 'error');
+    }
+  });
+  $('#finishUpdateFailure').addEventListener('click', finishUpdateFailure);
+  $('#closeRestoreNotice').addEventListener('click', () => $('#restoreNoticeBackdrop').classList.add('hidden'));
 }
 
 async function init() {
@@ -274,6 +322,7 @@ async function init() {
     const info = await window.coreStore.getInfo();
     $('#sidebarVersion').textContent = `v${info.version}`;
     $('#settingsVersion').textContent = info.version;
+    await showPendingUpdateFailure();
     await refreshPrograms();
     await refreshStoreVersion();
   } catch (error) {
