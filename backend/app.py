@@ -21,6 +21,7 @@ FILES_REPO = os.getenv("FILES_REPO", "")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config/programs.json")
 STORE_CONFIG_PATH = "config/store.json"
+SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
 
 GITHUB_API = "https://api.github.com"
 
@@ -448,10 +449,15 @@ def store_version():
     try:
         config = get_store_config()
 
+        support_url = SUPPORT_URL or str(config.get("support_url", "")).strip()
+        if support_url and not re.match(r"^https?://", support_url, re.IGNORECASE):
+            support_url = ""
+
         return jsonify({
             "enabled": bool(config.get("enabled", True)),
             "version": config["version"],
-            "release_notes": config.get("release_notes", [])
+            "release_notes": config.get("release_notes", []),
+            "support_url": support_url
         })
 
     except Exception as exc:
