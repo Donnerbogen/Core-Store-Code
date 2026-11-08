@@ -160,6 +160,94 @@ function extractZipSafely(zipPath, destination) {
   }
 }
 
+
+// Verschiebt einen Ordner sicher. Wenn TEMP und LOCALAPPDATA auf
+// unterschiedlichen Laufwerken liegen (Windows: EXDEV), wird geprüft kopiert.
+function moveDirectory(source, destination) {
+  const sourcePath = path.resolve(source);
+  const destinationPath = path.resolve(destination);
+
+  if (!fs.existsSync(sourcePath)) {
+    throw new Error(`Quellordner fehlt: ${sourcePath}`);
+  }
+  if (fs.existsSync(destinationPath)) {
+    throw new Error(`Zielordner existiert bereits: ${destinationPath}`);
+  }
+
+  fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+
+  try {
+    fs.renameSync(sourcePath, destinationPath);
+    return;
+  } catch (error) {
+    if (!error || error.code !== 'EXDEV') throw error;
+  }
+
+  const copyTemp = path.join(
+    path.dirname(destinationPath),
+    `.${path.basename(destinationPath)}.copy-${process.pid}-${Date.now()}`
+  );
+
+  try {
+    fs.cpSync(sourcePath, copyTemp, {
+      recursive: true,
+      force: false,
+      errorOnExist: true,
+      preserveTimestamps: true
+    });
+
+    const sourceFiles = collectFileManifest(sourcePath);
+    const copiedFiles = collectFileManifest(copyTemp);
+
+    if (sourceFiles.length !== copiedFiles.length) {
+      throw new Error('Dateikopie unvollständig: Anzahl der Dateien stimmt nicht überein.');
+    }
+
+    for (let i = 0; i < sourceFiles.length; i++) {
+      if (
+        sourceFiles[i].relative !== copiedFiles[i].relative ||
+        sourceFiles[i].size !== copiedFiles[i].size
+      ) {
+        throw new Error(`Dateikopie unvollständig: ${sourceFiles[i].relative}`);
+      }
+    }
+
+    fs.renameSync(copyTemp, destinationPath);
+    fs.rmSync(sourcePath, { recursive: true, force: true });
+  } catch (error) {
+    fs.rmSync(copyTemp, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function collectFileManifest(root) {
+  const result = [];
+
+  function walk(current, relativeBase) {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const absolute = path.join(current, entry.name);
+      const relative = relativeBase
+        ? `${relativeBase}/${entry.name}`
+        : entry.name;
+
+      if (entry.isDirectory()) {
+        walk(absolute, relative);
+      } else if (entry.isFile()) {
+        result.push({
+          relative,
+          size: fs.statSync(absolute).size
+        });
+      } else {
+        throw new Error(`Nicht unterstützter Dateityp beim Kopieren: ${relative}`);
+      }
+    }
+  }
+
+  walk(root, '');
+  result.sort((a, b) => a.relative.localeCompare(b.relative));
+  return result;
+}
+
 function parseVersion(version) {
   if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)) return [0, 0, 0];
   return version.split('.').map(Number);
@@ -242,35 +330,19 @@ function runProgramFile(program, programDir, action) {
   const waitKeys = {
     installation: 'wait_for_installation',
     update: 'wait_for_update',
-    update_first: 'wait_for_update_first',
-    update_second: 'wait_for_update_second',
     uninstallation: 'wait_for_uninstallation'
   };
   const wait = action === 'start' ? false : execution[waitKeys[action] || ''] !== false;
   const showConsole = execution.show_console !== false;
-  const timeoutDefaults = {
-    installation: 600,
-    uninstallation: 300,
-    update_first: 300,
-    update_second: 300,
-    update: 1800
-  };
-  const configuredTimeout = (program.timeouts || {})[action];
-  const timeoutMs = Math.max(1, Number(configuredTimeout || timeoutDefaults[action] || 1800)) * 1000;
 
   if (wait) {
     const result = spawnSync(command, args, {
       cwd: programDir,
       encoding: 'utf8',
       windowsHide: !showConsole,
-      timeout: timeoutMs
+      timeout: 30 * 60 * 1000
     });
-    if (result.error) {
-      if (result.error.code === 'ETIMEDOUT') {
-        throw new Error(`${relative} hat das Zeitlimit von ${Math.round(timeoutMs / 1000)} Sekunden überschritten.`);
-      }
-      throw result.error;
-    }
+    if (result.error) throw result.error;
     if (result.status !== 0) {
       const details = (result.stderr || result.stdout || '').trim();
       throw new Error(`${relative} wurde mit Fehlercode ${result.status}.${details ? `\n${details}` : ''}`);
@@ -319,7 +391,7 @@ async function installProgram(programId) {
     extractZipSafely(archive, stage);
     runProgramFile(program, stage, 'installation');
     if (fs.existsSync(target)) throw new Error(`Der Zielordner existiert bereits: ${target}`);
-    fs.renameSync(stage, target);
+    moveDirectory(stage, target);
     const installed = readInstalled();
     installed[programId] = { name: program.name || programId, version: program.version || '0.0.0', folder: target, installed: true };
     writeInstalled(installed);
@@ -350,38 +422,25 @@ async function updateProgram(programId) {
   const archive = path.join(temp, 'program.zip');
   const target = programDirectory(program);
   const backup = path.join(temp, 'backup');
-  let swapped = false;
   try {
-    // Schritt 1: Vorbereitungsdatei noch im bestehenden Programmordner ausführen.
-    runProgramFile(program, target, 'update_first');
-
     await downloadProgramArchive(programId, archive);
     extractZipSafely(archive, stage);
     preserveUserData(program, target, stage);
-
-    // Alte Update-Datei bleibt aus Kompatibilitätsgründen erhalten.
     runProgramFile(program, stage, 'update');
-
-    fs.renameSync(target, backup);
-    fs.renameSync(stage, target);
-    swapped = true;
-
-    // Schritt 2: Nachbereitungsdatei im neuen Programmordner ausführen.
-    runProgramFile(program, target, 'update_second');
-
+    moveDirectory(target, backup);
+    try {
+      moveDirectory(stage, target);
+    } catch (error) {
+      if (fs.existsSync(backup) && !fs.existsSync(target)) moveDirectory(backup, target);
+      throw error;
+    }
+    fs.rmSync(backup, { recursive: true, force: true });
     const installed = readInstalled();
     installed[programId] = { name: program.name || programId, version: program.version || '0.0.0', folder: target, installed: true };
     writeInstalled(installed);
-
-    fs.rmSync(backup, { recursive: true, force: true });
     return { success: true, programs: await getPrograms() };
-  } catch (error) {
-    // Bei Fehlern nach dem Austausch die vorherige Programmversion zurückholen.
-    if (swapped && fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
-    if (fs.existsSync(backup) && !fs.existsSync(target)) fs.renameSync(backup, target);
-    throw error;
   } finally {
-    if (fs.existsSync(backup) && !fs.existsSync(target)) fs.renameSync(backup, target);
+    if (fs.existsSync(backup) && !fs.existsSync(target)) moveDirectory(backup, target);
     fs.rmSync(temp, { recursive: true, force: true });
   }
 }
@@ -393,17 +452,7 @@ async function uninstallProgram(programId) {
   if (!program.state.installed) throw new Error('Programm ist nicht installiert.');
   const target = programDirectory(program);
   runProgramFile(program, target, 'uninstallation');
-
-  // Individuelle Wartezeit zwischen Deinstallationsskript und Dateilöschung.
-  const deleteDelay = Math.max(0, Number(program.deinstall_delete_delay || 0));
-  if (deleteDelay > 0) {
-    await new Promise(resolve => setTimeout(resolve, deleteDelay * 1000));
-  }
-
-  fs.rmSync(target, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
-  if (fs.existsSync(target)) {
-    throw new Error(`Programmdateien konnten nicht vollständig gelöscht werden: ${target}`);
-  }
+  fs.rmSync(target, { recursive: true, force: true });
   const installed = readInstalled();
   delete installed[programId];
   writeInstalled(installed);
