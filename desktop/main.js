@@ -242,19 +242,35 @@ function runProgramFile(program, programDir, action) {
   const waitKeys = {
     installation: 'wait_for_installation',
     update: 'wait_for_update',
+    update_first: 'wait_for_update_first',
+    update_second: 'wait_for_update_second',
     uninstallation: 'wait_for_uninstallation'
   };
   const wait = action === 'start' ? false : execution[waitKeys[action] || ''] !== false;
   const showConsole = execution.show_console !== false;
+  const timeoutDefaults = {
+    installation: 600,
+    uninstallation: 300,
+    update_first: 300,
+    update_second: 300,
+    update: 1800
+  };
+  const configuredTimeout = (program.timeouts || {})[action];
+  const timeoutMs = Math.max(1, Number(configuredTimeout || timeoutDefaults[action] || 1800)) * 1000;
 
   if (wait) {
     const result = spawnSync(command, args, {
       cwd: programDir,
       encoding: 'utf8',
       windowsHide: !showConsole,
-      timeout: 30 * 60 * 1000
+      timeout: timeoutMs
     });
-    if (result.error) throw result.error;
+    if (result.error) {
+      if (result.error.code === 'ETIMEDOUT') {
+        throw new Error(`${relative} hat das Zeitlimit von ${Math.round(timeoutMs / 1000)} Sekunden überschritten.`);
+      }
+      throw result.error;
+    }
     if (result.status !== 0) {
       const details = (result.stderr || result.stdout || '').trim();
       throw new Error(`${relative} wurde mit Fehlercode ${result.status}.${details ? `\n${details}` : ''}`);
@@ -334,23 +350,36 @@ async function updateProgram(programId) {
   const archive = path.join(temp, 'program.zip');
   const target = programDirectory(program);
   const backup = path.join(temp, 'backup');
+  let swapped = false;
   try {
+    // Schritt 1: Vorbereitungsdatei noch im bestehenden Programmordner ausführen.
+    runProgramFile(program, target, 'update_first');
+
     await downloadProgramArchive(programId, archive);
     extractZipSafely(archive, stage);
     preserveUserData(program, target, stage);
+
+    // Alte Update-Datei bleibt aus Kompatibilitätsgründen erhalten.
     runProgramFile(program, stage, 'update');
+
     fs.renameSync(target, backup);
-    try {
-      fs.renameSync(stage, target);
-    } catch (error) {
-      if (fs.existsSync(backup) && !fs.existsSync(target)) fs.renameSync(backup, target);
-      throw error;
-    }
-    fs.rmSync(backup, { recursive: true, force: true });
+    fs.renameSync(stage, target);
+    swapped = true;
+
+    // Schritt 2: Nachbereitungsdatei im neuen Programmordner ausführen.
+    runProgramFile(program, target, 'update_second');
+
     const installed = readInstalled();
     installed[programId] = { name: program.name || programId, version: program.version || '0.0.0', folder: target, installed: true };
     writeInstalled(installed);
+
+    fs.rmSync(backup, { recursive: true, force: true });
     return { success: true, programs: await getPrograms() };
+  } catch (error) {
+    // Bei Fehlern nach dem Austausch die vorherige Programmversion zurückholen.
+    if (swapped && fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
+    if (fs.existsSync(backup) && !fs.existsSync(target)) fs.renameSync(backup, target);
+    throw error;
   } finally {
     if (fs.existsSync(backup) && !fs.existsSync(target)) fs.renameSync(backup, target);
     fs.rmSync(temp, { recursive: true, force: true });
@@ -364,7 +393,17 @@ async function uninstallProgram(programId) {
   if (!program.state.installed) throw new Error('Programm ist nicht installiert.');
   const target = programDirectory(program);
   runProgramFile(program, target, 'uninstallation');
-  fs.rmSync(target, { recursive: true, force: true });
+
+  // Individuelle Wartezeit zwischen Deinstallationsskript und Dateilöschung.
+  const deleteDelay = Math.max(0, Number(program.deinstall_delete_delay || 0));
+  if (deleteDelay > 0) {
+    await new Promise(resolve => setTimeout(resolve, deleteDelay * 1000));
+  }
+
+  fs.rmSync(target, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
+  if (fs.existsSync(target)) {
+    throw new Error(`Programmdateien konnten nicht vollständig gelöscht werden: ${target}`);
+  }
   const installed = readInstalled();
   delete installed[programId];
   writeInstalled(installed);
