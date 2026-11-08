@@ -165,7 +165,9 @@ def validate_program(program):
         "installation",
         "start",
         "uninstallation",
-        "update"
+        "update_first",
+        "update_second",
+        "update"  # Legacy compatibility
     ):
         value = files.get(key)
 
@@ -180,6 +182,33 @@ def validate_program(program):
         raise ValueError("Ungültige execution-Konfiguration.")
 
     program["execution"] = execution
+
+    timeouts = program.get("timeouts", {})
+    if not isinstance(timeouts, dict):
+        raise ValueError("Ungültige timeouts-Konfiguration.")
+
+    timeout_defaults = {
+        "installation": 600,
+        "uninstallation": 300,
+        "update_first": 300,
+        "update_second": 300
+    }
+    validated_timeouts = {}
+    for key, default in timeout_defaults.items():
+        value = timeouts.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Timeout '{key}' muss eine Zahl in Sekunden sein.")
+        if value < 1 or value > 86400:
+            raise ValueError(f"Timeout '{key}' muss zwischen 1 und 86400 Sekunden liegen.")
+        validated_timeouts[key] = int(value)
+    program["timeouts"] = validated_timeouts
+
+    delete_delay = program.get("deinstall_delete_delay", 0)
+    if isinstance(delete_delay, bool) or not isinstance(delete_delay, (int, float)):
+        raise ValueError("deinstall_delete_delay muss eine Zahl in Sekunden sein.")
+    if delete_delay < 0 or delete_delay > 86400:
+        raise ValueError("deinstall_delete_delay muss zwischen 0 und 86400 Sekunden liegen.")
+    program["deinstall_delete_delay"] = int(delete_delay)
 
     preserve = program.get("update_preserve", [])
 
