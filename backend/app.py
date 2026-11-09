@@ -21,6 +21,7 @@ FILES_REPO = os.getenv("FILES_REPO", "")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config/programs.json")
 STORE_CONFIG_PATH = "config/store.json"
+UPDATE_CONFIG_PATH = "config/update.json"
 SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
 
 GITHUB_API = "https://api.github.com"
@@ -129,6 +130,61 @@ def get_json(path):
         raise ValueError(
             f"JSON-Datei {path} ist ungültig: {exc}"
         )
+
+
+def get_update_status():
+    """Liest den Wartungsstatus. Eine noch nicht vorhandene Datei bedeutet Normalbetrieb."""
+    try:
+        config = get_json(UPDATE_CONFIG_PATH)
+    except FileNotFoundError:
+        # Fail closed: Fehlt die Wartungsdatei, werden keine Store-Daten ausgeliefert.
+        # So bleibt der Store auch dann gesperrt, wenn die Datei versehentlich gelöscht wurde.
+        return {
+            "maintenance": True,
+            "title": "Core Store vorübergehend gesperrt",
+            "message": "Die Wartungskonfiguration fehlt. Bitte versuche es später erneut.",
+            "show_retry": True
+        }
+
+    if not isinstance(config, dict):
+        raise ValueError("config/update.json muss ein JSON-Objekt enthalten.")
+
+    maintenance = config.get("maintenance", False)
+    if not isinstance(maintenance, bool):
+        raise ValueError("config/update.json: 'maintenance' muss true oder false sein.")
+
+    title = config.get("title", "Core Store wird aktualisiert")
+    message = config.get(
+        "message",
+        "Der Core Store wird gerade aktualisiert. Bitte versuche es später erneut."
+    )
+
+    if not isinstance(title, str) or not title.strip():
+        title = "Core Store wird aktualisiert"
+    if not isinstance(message, str) or not message.strip():
+        message = "Der Core Store wird gerade aktualisiert. Bitte versuche es später erneut."
+
+    return {
+        "maintenance": maintenance,
+        "title": title[:120],
+        "message": message[:1000],
+        "show_retry": bool(config.get("show_retry", True))
+    }
+
+
+def maintenance_response():
+    """Sperrt Store-API-Endpunkte während der Wartung mit HTTP 503."""
+    status = get_update_status()
+    if not status["maintenance"]:
+        return None
+
+    return jsonify({
+        "error": status["message"],
+        "maintenance": True,
+        "title": status["title"],
+        "message": status["message"],
+        "show_retry": status["show_retry"]
+    }), 503
 
 
 # ============================================================
@@ -400,12 +456,30 @@ def health():
     })
 
 
+@app.route("/api/store/status", methods=["GET"])
+def store_status():
+    try:
+        return jsonify(get_update_status())
+    except Exception as exc:
+        return jsonify({
+            "error": str(exc),
+            "maintenance": True,
+            "title": "Core Store Status nicht verfügbar",
+            "message": "Der Wartungsstatus konnte nicht geprüft werden. Bitte versuche es später erneut.",
+            "show_retry": True
+        }), 503
+
+
 # ------------------------------------------------------------
 # PROGRAMME
 # ------------------------------------------------------------
 
 @app.route("/api/programs", methods=["GET"])
 def programs():
+    blocked = maintenance_response()
+    if blocked is not None:
+        return blocked
+
     try:
         config = get_programs_config()
         result = []
@@ -435,6 +509,10 @@ def programs():
     methods=["GET"]
 )
 def download_program(program_id):
+    blocked = maintenance_response()
+    if blocked is not None:
+        return blocked
+
     try:
         program = get_program(program_id)
 
@@ -465,6 +543,10 @@ def download_program(program_id):
 
 @app.route("/api/store/version", methods=["GET"])
 def store_version():
+    blocked = maintenance_response()
+    if blocked is not None:
+        return blocked
+
     try:
         config = get_store_config()
 
@@ -489,6 +571,10 @@ def store_version():
 
 @app.route("/api/store/download", methods=["GET"])
 def store_download():
+    blocked = maintenance_response()
+    if blocked is not None:
+        return blocked
+
     try:
         config = get_store_config()
 
