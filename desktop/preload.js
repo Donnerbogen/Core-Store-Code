@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('coreStore', {
   getInfo: () => ipcRenderer.invoke('app:get-info'),
+  checkMaintenance: () => ipcRenderer.invoke('store:check-maintenance'),
   getPrograms: () => ipcRenderer.invoke('store:get-programs'),
   installProgram: id => ipcRenderer.invoke('store:install', id),
   startProgram: id => ipcRenderer.invoke('store:start', id),
