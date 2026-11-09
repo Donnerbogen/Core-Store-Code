@@ -11,3 +11,13 @@
 .restore-status{color:#ffd27b!important;border-left:2px solid rgba(255,210,123,.55);padding-left:10px}.restore-mark{color:#43e0ad!important;border-color:rgba(67,224,173,.5)!important}.update-failure-modal{max-width:520px}.update-failure-modal .modal-actions button{min-width:130px}
 
 .error-code{font-family:Consolas,monospace!important;font-weight:800!important;color:#ff8b8b!important;letter-spacing:.6px;background:rgba(255,110,110,.08);border:1px solid rgba(255,110,110,.24);border-radius:8px;padding:9px 12px}
+
+/* Core Store Wartungsmodus */
+.maintenance-backdrop{z-index:100;background:rgba(2,7,14,.94);backdrop-filter:blur(8px)}
+.maintenance-modal{width:min(520px,92vw);border-color:rgba(66,215,255,.42);box-shadow:0 25px 90px #000c;padding:32px}
+.maintenance-mark{border-color:rgba(255,194,91,.6);color:#ffc25b;margin-bottom:18px}
+.maintenance-modal .eyebrow{margin-bottom:10px}
+.maintenance-modal h3{font-size:27px}
+.maintenance-modal p{font-size:12px;line-height:1.75}
+.maintenance-note{border-left:2px solid rgba(66,215,255,.5);padding:9px 12px;background:rgba(66,215,255,.055);color:#9bb2c7!important}
+.maintenance-modal .modal-actions{justify-content:flex-start}
