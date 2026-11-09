@@ -91,6 +91,18 @@
   </div>
 
   <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+  <div class="modal-backdrop maintenance-backdrop hidden" id="maintenanceBackdrop" role="alertdialog" aria-modal="true" aria-labelledby="maintenanceTitle">
+    <div class="confirm-modal maintenance-modal">
+      <div class="modal-mark maintenance-mark">!</div>
+      <div class="eyebrow">CORE NETWORK / WARTUNG</div>
+      <h3 id="maintenanceTitle">Core Store wird aktualisiert</h3>
+      <p id="maintenanceMessage">Der Core Store wird gerade aktualisiert. Bitte versuche es später erneut.</p>
+      <p class="maintenance-note">Während der Wartung sind Downloads und Store-Aktionen vorübergehend gesperrt. Bereits installierte Programme auf deinem Gerät bleiben unverändert.</p>
+      <div class="modal-actions">
+        <button class="primary-button" id="maintenanceRetry">Erneut prüfen</button>
+      </div>
+    </div>
+  </div>
   <div class="modal-backdrop hidden" id="confirmBackdrop">
     <div class="confirm-modal"><div class="modal-mark">!</div><h3 id="confirmTitle">Aktion bestätigen</h3><p id="confirmText">Möchtest du fortfahren?</p><div class="modal-actions"><button class="secondary-button" id="confirmCancel">Abbrechen</button><button class="danger-button" id="confirmAccept">Bestätigen</button></div></div>
   </div>
