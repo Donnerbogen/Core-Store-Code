@@ -137,6 +137,22 @@ async function refreshPrograms() {
     $('#apiStatus').textContent = 'Verbunden – Programmliste erfolgreich geladen.';
     $('#apiAddress').textContent = 'Render-API erreichbar';
   } catch (error) {
+    // Falls der Wartungsmodus aktiviert wurde, waehrend der Store bereits offen war,
+    // beim naechsten fehlgeschlagenen API-Aufruf ebenfalls den Wartungshinweis zeigen.
+    try {
+      const maintenance = await window.coreStore.checkMaintenance();
+      if (maintenance.maintenance) {
+        $('#maintenanceTitle').textContent = maintenance.title;
+        $('#maintenanceMessage').textContent = maintenance.message;
+        $('#maintenanceBackdrop').classList.remove('hidden');
+        $('#connectionText').textContent = 'Wartungsmodus';
+        $('#apiStatus').textContent = 'Der Store befindet sich im Wartungsmodus.';
+        $('#apiAddress').textContent = 'Store-Funktionen vorübergehend gesperrt';
+        $('#maintenanceRetry').hidden = !maintenance.showRetry;
+        return;
+      }
+    } catch {}
+
     $('#connectionText').textContent = 'Keine Verbindung';
     $('#apiStatus').textContent = error.message;
     $('#apiAddress').textContent = 'Render-API nicht erreichbar';
@@ -307,6 +323,25 @@ function bindEvents() {
   });
   $('#finishUpdateFailure').addEventListener('click', finishUpdateFailure);
   $('#closeRestoreNotice').addEventListener('click', () => $('#restoreNoticeBackdrop').classList.add('hidden'));
+  $('#maintenanceRetry').addEventListener('click', async () => {
+    const button = $('#maintenanceRetry');
+    button.disabled = true;
+    button.textContent = 'PRÜFE ...';
+    try {
+      const status = await window.coreStore.checkMaintenance();
+      if (!status.maintenance) {
+        window.location.reload();
+        return;
+      }
+      $('#maintenanceTitle').textContent = status.title;
+      $('#maintenanceMessage').textContent = status.message;
+    } catch (error) {
+      $('#maintenanceMessage').textContent = 'Der Wartungsstatus konnte nicht geprüft werden. Bitte kontrolliere deine Internetverbindung und versuche es erneut.';
+    } finally {
+      button.disabled = false;
+      button.textContent = 'ERNEUT PRÜFEN';
+    }
+  });
 }
 
 async function init() {
@@ -317,6 +352,20 @@ async function init() {
     }
     if (typeof window.coreStore.getInfo !== 'function' || typeof window.coreStore.getPrograms !== 'function') {
       throw new Error('Die Core-Store-Schnittstelle wurde unvollständig geladen. Bitte prüfe desktop/preload.js.');
+    }
+
+    if (typeof window.coreStore.checkMaintenance === 'function') {
+      const maintenance = await window.coreStore.checkMaintenance();
+      if (maintenance.maintenance) {
+        $('#maintenanceTitle').textContent = maintenance.title;
+        $('#maintenanceMessage').textContent = maintenance.message;
+        $('#maintenanceBackdrop').classList.remove('hidden');
+        $('#connectionText').textContent = 'Wartungsmodus';
+        $('#apiStatus').textContent = 'Der Store befindet sich im Wartungsmodus.';
+        $('#apiAddress').textContent = 'Store-Funktionen vorübergehend gesperrt';
+        $('#maintenanceRetry').hidden = !maintenance.showRetry;
+        return;
+      }
     }
 
     const info = await window.coreStore.getInfo();
