@@ -11,57 +11,155 @@ const APP_VERSION = require('./package.json').version;
 const APP_ROOT = app.getAppPath();
 const LOCAL_ROOT = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
 const APPDATA_ROOT = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
-
-// Ein einziger Speicherort für sämtliche CORE-Network-Daten.
-const DATA_ROOT = path.join(APPDATA_ROOT, 'Core Network');
-const STORE_ROOT = path.join(DATA_ROOT, 'Core Store');
+// Sämtliche CORE-Network-Daten liegen unter genau einem gemeinsamen Hauptordner.
+const CORE_ROOT = path.join(APPDATA_ROOT, 'Core Network');
+const DATA_ROOT = CORE_ROOT; // Kompatibilitätsname für vorhandene Update-/Backup-Funktionen.
+const STORE_ROOT = path.join(CORE_ROOT, 'Core Store');
 const INSTALLER_ROOT = path.join(STORE_ROOT, 'Installer');
-const PROGRAMS_ROOT = DATA_ROOT;
-const BACKUP_ROOT = path.join(DATA_ROOT, 'Backups');
-const TEMP_ROOT = path.join(DATA_ROOT, 'Temp');
-
+const PROGRAMS_ROOT = CORE_ROOT;
+const BACKUP_ROOT = path.join(CORE_ROOT, 'Backups');
+const TEMP_ROOT = path.join(CORE_ROOT, 'Temp');
+const LOG_ROOT = path.join(STORE_ROOT, 'Logs');
+const LOG_PATH = path.join(LOG_ROOT, 'core-store.log');
 const SETTINGS_PATH = path.join(STORE_ROOT, 'settings.json');
 const INSTALLED_PATH = path.join(STORE_ROOT, 'installed.json');
 const UPDATE_FAILURE_PATH = path.join(STORE_ROOT, 'update-failure.json');
 const SUPPORT_CACHE_PATH = path.join(STORE_ROOT, 'support-url.json');
-const LEGACY_LOCAL_ROOT = path.join(LOCAL_ROOT, 'Core Network');
-const LEGACY_STORE_ROOT = path.join(LEGACY_LOCAL_ROOT, 'Core Store');
 const REQUEST_TIMEOUT = 120000;
+const MAX_ZIP_ENTRIES = 10000;
+const MAX_EXTRACTED_BYTES = 512 * 1024 * 1024;
+const activeOperations = new Set();
+let installedManifestQueue = Promise.resolve();
+
+// Electron-eigene Nutzerdaten und Cache ebenfalls im CORE-Network-Hauptordner halten.
+try {
+  for (const directory of [STORE_ROOT, TEMP_ROOT, LOG_ROOT]) {
+    fs.mkdirSync(directory, { recursive: true });
+  }
+  const electronPaths = [
+    ['userData', path.join(STORE_ROOT, 'UserData')],
+    ['sessionData', path.join(STORE_ROOT, 'SessionData')],
+    ['cache', path.join(TEMP_ROOT, 'Cache')],
+    ['temp', TEMP_ROOT],
+    ['logs', LOG_ROOT],
+    ['crashDumps', path.join(TEMP_ROOT, 'CrashDumps')]
+  ];
+  for (const [name, location] of electronPaths) {
+    try { app.setPath(name, location); }
+    catch (error) { console.warn(`Electron-Pfad '${name}' konnte nicht angepasst werden:`, error.message); }
+  }
+} catch (error) {
+  console.warn('CORE-Network-Speicherpfade konnten vor dem Start nicht vollständig vorbereitet werden:', error.message);
+}
+
+function log(message, details = '') {
+  try {
+    fs.mkdirSync(LOG_ROOT, { recursive: true });
+    if (fs.existsSync(LOG_PATH) && fs.statSync(LOG_PATH).size > 5 * 1024 * 1024) {
+      const previousLog = `${LOG_PATH}.1`;
+      fs.rmSync(previousLog, { force: true });
+      fs.renameSync(LOG_PATH, previousLog);
+    }
+    const suffix = details ? ` | ${String(details.stack || details.message || details)}` : '';
+    fs.appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${message}${suffix}\n`, 'utf8');
+  } catch (error) {
+    console.error('Core-Store-Log konnte nicht geschrieben werden:', error);
+  }
+}
+
+async function runExclusive(key, task) {
+  if (activeOperations.has(key)) {
+    throw new Error('Für dieses Programm läuft bereits ein Vorgang. Bitte warte, bis er abgeschlossen ist.');
+  }
+  activeOperations.add(key);
+  try { return await task(); }
+  finally { activeOperations.delete(key); }
+}
+
+function createTempDirectory(prefix) {
+  fs.mkdirSync(TEMP_ROOT, { recursive: true });
+  return fs.mkdtempSync(path.join(TEMP_ROOT, prefix));
+}
+
+function mutateInstalled(mutator) {
+  const operation = installedManifestQueue.then(() => {
+    const installed = readInstalled();
+    const result = mutator(installed);
+    writeInstalled(installed);
+    return result;
+  });
+  installedManifestQueue = operation.catch(() => {});
+  return operation;
+}
 
 let mainWindow;
 let apiUrl = '';
 
+function copyFileIfMissing(source, destination) {
+  if (!fs.existsSync(destination) && fs.existsSync(source) && fs.statSync(source).isFile()) {
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(source, destination);
+  }
+}
+
+function copyDirectoryMissing(source, destination) {
+  if (!fs.existsSync(source) || !fs.statSync(source).isDirectory()) return;
+  fs.mkdirSync(destination, { recursive: true });
+  for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+    const from = path.join(source, entry.name);
+    const to = path.join(destination, entry.name);
+    if (entry.isDirectory()) copyDirectoryMissing(from, to);
+    else if (entry.isFile()) copyFileIfMissing(from, to);
+  }
+}
+
 function ensureDirectories() {
-  fs.mkdirSync(DATA_ROOT, { recursive: true });
-  fs.mkdirSync(STORE_ROOT, { recursive: true });
-  fs.mkdirSync(INSTALLER_ROOT, { recursive: true });
-  fs.mkdirSync(PROGRAMS_ROOT, { recursive: true });
-  fs.mkdirSync(BACKUP_ROOT, { recursive: true });
-  fs.mkdirSync(TEMP_ROOT, { recursive: true });
-
-  // Einstellungen aus dem früheren LOCALAPPDATA-Speicherort übernehmen.
-  if (!fs.existsSync(SETTINGS_PATH)) {
-    const legacySettings = path.join(LEGACY_STORE_ROOT, 'settings.json');
-    const packagedSettings = path.join(APP_ROOT, 'settings.json');
-    const source = fs.existsSync(legacySettings) ? legacySettings : packagedSettings;
-
-    if (fs.existsSync(source)) {
-      fs.copyFileSync(source, SETTINGS_PATH);
-    }
+  for (const directory of [CORE_ROOT, STORE_ROOT, INSTALLER_ROOT, BACKUP_ROOT, TEMP_ROOT, LOG_ROOT]) {
+    fs.mkdirSync(directory, { recursive: true });
+  }
+  // Verwaiste temporäre Vorgänge älter als 24 Stunden entfernen.
+  for (const entry of fs.readdirSync(TEMP_ROOT, { withFileTypes: true })) {
+    const candidate = path.join(TEMP_ROOT, entry.name);
+    try {
+      if (Date.now() - fs.statSync(candidate).mtimeMs > 24 * 60 * 60 * 1000) {
+        fs.rmSync(candidate, { recursive: true, force: true });
+      }
+    } catch (error) { log(`Temporärer Ordner konnte nicht bereinigt werden: ${candidate}`, error); }
   }
 
-  // Installationsstatus aus früheren Versionen migrieren.
+  // Migration aus älteren Versionen: Store-Daten lagen unter LOCALAPPDATA.
+  const legacyRoot = path.join(LOCAL_ROOT, 'Core Network');
+  const legacyStore = path.join(legacyRoot, 'Core Store');
+  for (const file of ['settings.json', 'installed.json', 'update-failure.json', 'support-url.json', 'update-status.json']) {
+    copyFileIfMissing(path.join(legacyStore, file), path.join(STORE_ROOT, file));
+  }
+  copyDirectoryMissing(path.join(legacyStore, 'Installer'), INSTALLER_ROOT);
+  const legacyBackupRoot = path.join(LOCAL_ROOT, 'Core Network Backup');
+  if (fs.existsSync(legacyBackupRoot)) {
+    copyDirectoryMissing(legacyBackupRoot, path.join(BACKUP_ROOT, 'Legacy'));
+  }
+  copyFileIfMissing(path.join(legacyRoot, '_store', 'installed.json'), INSTALLED_PATH);
   if (!fs.existsSync(INSTALLED_PATH)) {
-    const legacyCandidates = [
-      path.join(LEGACY_STORE_ROOT, 'installed.json'),
-      path.join(LEGACY_LOCAL_ROOT, '_store', 'installed.json')
-    ];
-    const legacyInstalled = legacyCandidates.find(candidate => fs.existsSync(candidate));
-
-    if (legacyInstalled) {
-      fs.copyFileSync(legacyInstalled, INSTALLED_PATH);
-    }
+    try {
+      const recoverable = fs.readdirSync(STORE_ROOT)
+        .filter(name => /^installed\.json\.\d+\.bak$/.test(name))
+        .map(name => path.join(STORE_ROOT, name))
+        .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+      if (recoverable.length) fs.copyFileSync(recoverable[0], INSTALLED_PATH);
+    } catch (error) { log('Wiederherstellung von installed.json fehlgeschlagen', error); }
   }
+
+  // Noch ältere Store-Versionen hatten Einstellungen direkt im alten Hauptordner.
+  copyFileIfMissing(path.join(legacyRoot, 'settings.json'), SETTINGS_PATH);
+
+  if (!fs.existsSync(SETTINGS_PATH)) {
+    const packagedSettings = path.join(APP_ROOT, 'settings.json');
+    copyFileIfMissing(packagedSettings, SETTINGS_PATH);
+  }
+
+  // Alte Programminstallationen unter LOCALAPPDATA bleiben erhalten und werden
+  // beim ersten Laden des jeweiligen Programms gezielt in den neuen Zielpfad verschoben.
+  log(`Core Store initialisiert. Hauptordner: ${CORE_ROOT}`);
 }
 
 function loadSettings() {
@@ -80,31 +178,36 @@ function loadSettings() {
 }
 
 function readInstalled() {
+  if (!fs.existsSync(INSTALLED_PATH)) return {};
   try {
     const data = JSON.parse(fs.readFileSync(INSTALLED_PATH, 'utf8'));
-
-    return data && typeof data === 'object' && !Array.isArray(data)
-      ? data
-      : {};
-  } catch {
-    return {};
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error('installed.json muss ein JSON-Objekt enthalten.');
+    }
+    return data;
+  } catch (error) {
+    log('installed.json ist beschädigt oder nicht lesbar', error);
+    throw new Error(`Die Installationsübersicht ist beschädigt: ${error.message}. Datei: ${INSTALLED_PATH}`);
   }
 }
 
 function writeInstalled(data) {
-  const temporary = `${INSTALLED_PATH}.tmp`;
-
-  fs.writeFileSync(
-    temporary,
-    JSON.stringify(data, null, 2),
-    'utf8'
-  );
-
-  if (fs.existsSync(INSTALLED_PATH)) {
-    fs.rmSync(INSTALLED_PATH, { force: true });
+  fs.mkdirSync(path.dirname(INSTALLED_PATH), { recursive: true });
+  const temporary = `${INSTALLED_PATH}.${process.pid}.tmp`;
+  const previous = `${INSTALLED_PATH}.${process.pid}.bak`;
+  fs.writeFileSync(temporary, JSON.stringify(data, null, 2), 'utf8');
+  try {
+    fs.rmSync(previous, { force: true });
+    if (fs.existsSync(INSTALLED_PATH)) fs.renameSync(INSTALLED_PATH, previous);
+    fs.renameSync(temporary, INSTALLED_PATH);
+    fs.rmSync(previous, { force: true });
+  } catch (error) {
+    if (!fs.existsSync(INSTALLED_PATH) && fs.existsSync(previous)) {
+      try { fs.renameSync(previous, INSTALLED_PATH); } catch {}
+    }
+    fs.rmSync(temporary, { force: true });
+    throw error;
   }
-
-  fs.renameSync(temporary, INSTALLED_PATH);
 }
 
 function validateId(value) {
@@ -128,7 +231,7 @@ function safeFolderName(value, fallback) {
     name = String(fallback || 'Programm');
   }
 
-  if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(name)) {
+  if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$/i.test(name)) {
     name = `_${name}`;
   }
 
@@ -155,7 +258,11 @@ function safeRelative(value) {
 
   const parts = normalized.split('/');
 
-  if (parts.some(part => !part || part === '.' || part === '..')) {
+  if (parts.some(part =>
+    !part || part === '.' || part === '..' ||
+    /[<>:\"|?*\x00-\x1F]/.test(part) || /[. ]$/.test(part) ||
+    /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$/i.test(part)
+  )) {
     throw new Error('Ungültiger Dateipfad.');
   }
 
@@ -184,68 +291,47 @@ function programDirectory(program) {
   );
 }
 
-function requestBuffer(url, timeout = REQUEST_TIMEOUT) {
+function requestBuffer(url, timeout = REQUEST_TIMEOUT, redirectCount = 0) {
   return new Promise((resolve, reject) => {
-    const client = url.startsWith('https:') ? https : http;
-
-    const request = client.get(
-      url,
-      {
-        headers: {
-          'User-Agent': 'Core-Store-Desktop'
-        }
-      },
-      response => {
-        if (
-          response.statusCode >= 300 &&
-          response.statusCode < 400 &&
-          response.headers.location
-        ) {
-          response.resume();
-
-          requestBuffer(response.headers.location, timeout)
-            .then(resolve, reject);
-
+    if (redirectCount > 5) return reject(new Error('Zu viele HTTP-Weiterleitungen.'));
+    let parsed;
+    try { parsed = new URL(url); }
+    catch { return reject(new Error('Ungültige Serveradresse.')); }
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      return reject(new Error('Nicht unterstütztes Netzwerkprotokoll.'));
+    }
+    const client = parsed.protocol === 'https:' ? https : http;
+    const request = client.get(parsed, { headers: { 'User-Agent': 'Core-Store-Desktop' } }, response => {
+      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        response.resume();
+        const nextUrl = new URL(response.headers.location, parsed).toString();
+        requestBuffer(nextUrl, timeout, redirectCount + 1).then(resolve, reject);
+        return;
+      }
+      const chunks = [];
+      let total = 0;
+      const maxBytes = 200 * 1024 * 1024;
+      response.on('data', chunk => {
+        total += chunk.length;
+        if (total > maxBytes) {
+          request.destroy(new Error('Serverantwort überschreitet das erlaubte Limit von 200 MB.'));
+          response.destroy();
           return;
         }
-
-        const chunks = [];
-
-        response.on('data', chunk => chunks.push(chunk));
-
-        response.on('end', () => {
-          const body = Buffer.concat(chunks);
-
-          if (
-            response.statusCode < 200 ||
-            response.statusCode >= 300
-          ) {
-            let message = body.toString('utf8');
-
-            try {
-              message = JSON.parse(message).error || message;
-            } catch {}
-
-            reject(
-              new Error(
-                `HTTP ${response.statusCode}: ${message.slice(0, 500)}`
-              )
-            );
-
-            return;
-          }
-
-          resolve(body);
-        });
-      }
-    );
-
-    request.setTimeout(timeout, () => {
-      request.destroy(
-        new Error('Zeitüberschreitung bei der Serveranfrage.')
-      );
+        chunks.push(chunk);
+      });
+      response.on('end', () => {
+        const body = Buffer.concat(chunks);
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          let message = body.toString('utf8');
+          try { message = JSON.parse(message).error || message; } catch {}
+          reject(new Error(`HTTP ${response.statusCode}: ${message.slice(0, 500)}`));
+          return;
+        }
+        resolve(body);
+      });
     });
-
+    request.setTimeout(timeout, () => request.destroy(new Error('Zeitüberschreitung bei der Serveranfrage.')));
     request.on('error', reject);
   });
 }
@@ -268,23 +354,32 @@ async function downloadToFile(endpoint, destination) {
 
 function extractZipSafely(zipPath, destination) {
   const root = path.resolve(destination);
-
   fs.mkdirSync(root, { recursive: true });
-
   const zip = new AdmZip(zipPath);
+  const entries = zip.getEntries();
+  if (!entries.length) throw new Error('Das ZIP-Archiv enthält keine Dateien.');
+  if (entries.length > MAX_ZIP_ENTRIES) throw new Error(`Das ZIP-Archiv enthält zu viele Einträge (maximal ${MAX_ZIP_ENTRIES}).`);
 
-  for (const entry of zip.getEntries()) {
+  let totalBytes = 0;
+  const seenPaths = new Set();
+  for (const entry of entries) {
     if (entry.isDirectory) continue;
-
     const relative = safeRelative(entry.entryName);
+    const collisionKey = relative.toLocaleLowerCase('en-US');
+    if (seenPaths.has(collisionKey)) throw new Error(`Doppelter Dateipfad im ZIP-Archiv: ${relative}`);
+    seenPaths.add(collisionKey);
+    // Unix-Symlinks in Archiven werden nicht akzeptiert.
+    const unixMode = (entry.header.attr >>> 16) & 0xF000;
+    if (unixMode === 0xA000) throw new Error(`Symbolische Links sind im Programmpaket nicht erlaubt: ${relative}`);
+    const data = entry.getData();
+    totalBytes += data.length;
+    if (totalBytes > MAX_EXTRACTED_BYTES) throw new Error('Das entpackte Programmpaket überschreitet 512 MB.');
     const target = safeChild(root, relative);
-
-    fs.mkdirSync(path.dirname(target), {
-      recursive: true
-    });
-
-    fs.writeFileSync(target, entry.getData());
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, data);
   }
+  if (totalBytes === 0) throw new Error('Das ZIP-Archiv enthält keine verwendbaren Dateien.');
+  return { entries: entries.length, bytes: totalBytes };
 }
 
 function parseVersion(version) {
@@ -313,10 +408,12 @@ function compareVersions(a, b) {
 function migrateLegacyProgramFolder(program) {
   const id = validateId(program.id);
   const target = programDirectory(program);
+  const legacyRoot = path.join(LOCAL_ROOT, 'Core Network');
   const legacyPaths = [
-    // Frühere Installationen lagen unter LOCALAPPDATA.
-    path.join(LEGACY_LOCAL_ROOT, safeFolderName(program.name, id)),
-    path.join(LEGACY_LOCAL_ROOT, 'Programs', id)
+    // Früheres Layout: %LOCALAPPDATA%\Core Network\<Programmname>
+    path.join(legacyRoot, safeFolderName(program.name, id)),
+    // Noch älteres Layout: %LOCALAPPDATA%\Core Network\Programs\<ID>
+    path.join(legacyRoot, 'Programs', id)
   ];
 
   if (!fs.existsSync(target)) {
@@ -370,6 +467,19 @@ async function getPrograms() {
   }
 
   const installed = readInstalled();
+  const ids = new Set();
+  const folders = new Set();
+  for (const program of data.programs) {
+    const id = validateId(program.id);
+    if (ids.has(id)) throw new Error(`Doppelte Programm-ID in der Programmliste: ${id}`);
+    ids.add(id);
+    const folder = safeFolderName(program.name, id).toLocaleLowerCase('en-US');
+    if (folder === 'core store' || folder === 'backups' || folder === 'temp') {
+      throw new Error(`Der Programmname '${program.name}' ist für einen reservierten CORE-Network-Ordner nicht zulässig.`);
+    }
+    if (folders.has(folder)) throw new Error(`Mehrere Programme verwenden denselben Zielordner: ${program.name}`);
+    folders.add(folder);
+  }
 
   return data.programs.map(program => ({
     ...program,
@@ -377,102 +487,98 @@ async function getPrograms() {
   }));
 }
 
+function buildProgramCommand(target) {
+  const ext = path.extname(target).toLowerCase();
+  if (ext === '.bat' || ext === '.cmd') {
+    return { command: process.env.ComSpec || 'cmd.exe', args: ['/d', '/s', '/c', `call \"${target}\"`] };
+  }
+  if (ext === '.py') return { command: 'py.exe', args: ['-3', target] };
+  if (ext === '.ps1') return { command: 'powershell.exe', args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', target] };
+  if (ext === '.exe') return { command: target, args: [] };
+  return null;
+}
+
 function runProgramFile(program, programDir, action) {
   const relative = program.files && program.files[action];
   const execution = program.execution || {};
-
-  if (!relative || execution[action] === false) {
-    return { skipped: true };
-  }
+  if (!relative || execution[action] === false) return { skipped: true };
 
   const target = safeChild(programDir, relative);
-
-  if (!fs.existsSync(target)) {
-    throw new Error(
-      `Datei für Aktion '${action}' fehlt: ${relative}`
-    );
+  if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
+    throw new Error(`Datei für Aktion '${action}' fehlt oder ist keine Datei: ${relative}`);
   }
 
-  const ext = path.extname(target).toLowerCase();
-
-  let command;
-  let args;
-
-  if (ext === '.bat' || ext === '.cmd') {
-    command = process.env.ComSpec || 'cmd.exe';
-    args = ['/d', '/s', '/c', `call "${target}"`];
-  } else if (ext === '.py') {
-    command = 'py';
-    args = ['-3', target];
-  } else if (ext === '.ps1') {
-    command = 'powershell.exe';
-    args = [
-      '-NoProfile',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-File',
-      target
-    ];
-  } else if (ext === '.exe') {
-    command = target;
-    args = [];
-  } else {
-    shell.openPath(target);
-    return { opened: true };
+  const launch = buildProgramCommand(target);
+  if (!launch) {
+    throw new Error(`Nicht unterstütztes Dateiformat für '${action}': ${path.extname(target) || '(keine Dateiendung)'}. Verwende .bat, .cmd, .exe, .py oder .ps1.`);
   }
 
-  const waitKeys = {
-    installation: 'wait_for_installation',
-    update: 'wait_for_update',
-    uninstallation: 'wait_for_uninstallation'
-  };
-
-  const wait =
-    action === 'start'
-      ? false
-      : execution[waitKeys[action] || ''] !== false;
-
+  // Installations, Updates und Deinstallationen müssen vollständig beendet sein,
+  // bevor der Store den jeweiligen Vorgang als erfolgreich markieren darf.
+  const wait = action !== 'start';
   const showConsole = execution.show_console !== false;
 
+  log(`Aktion '${action}' wird ausgeführt: ${relative}`, `Programm=${program.id}; cwd=${programDir}`);
+
   if (wait) {
-    const result = spawnSync(command, args, {
+    const result = spawnSync(launch.command, launch.args, {
       cwd: programDir,
       encoding: 'utf8',
       windowsHide: !showConsole,
-      timeout: 30 * 60 * 1000,
-      windowsVerbatimArguments:
-        process.platform === 'win32' &&
-        (ext === '.bat' || ext === '.cmd')
+      timeout: Number(execution.timeout_ms) > 0 ? Math.min(Number(execution.timeout_ms), 60 * 60 * 1000) : 30 * 60 * 1000,
+      maxBuffer: 10 * 1024 * 1024,
+      windowsVerbatimArguments: process.platform === 'win32' && ['.bat', '.cmd'].includes(path.extname(target).toLowerCase())
     });
-
-    if (result.error) throw result.error;
-
+    if (result.error) throw new Error(`${relative}: ${result.error.message}`);
+    if (result.signal) throw new Error(`${relative} wurde durch Signal ${result.signal} beendet.`);
     if (result.status !== 0) {
-      const details = (
-        result.stderr ||
-        result.stdout ||
-        ''
-      ).trim();
-
-      throw new Error(
-        `${relative} wurde mit Fehlercode ${result.status}.` +
-        `${details ? `\n${details}` : ''}`
-      );
+      const details = (result.stderr || result.stdout || '').trim();
+      throw new Error(`${relative} wurde mit Fehlercode ${result.status === null ? 'unbekannt' : result.status} beendet.${details ? `\n${details}` : ''}`);
     }
-
-    return { completed: true };
+    return { completed: true, exitCode: 0 };
   }
 
-  const child = spawn(command, args, {
-    cwd: programDir,
-    detached: true,
-    stdio: showConsole ? 'inherit' : 'ignore',
-    windowsHide: !showConsole
+  return new Promise((resolve, reject) => {
+    let spawned = false;
+    let settled = false;
+    let launchTimer = null;
+    const child = spawn(launch.command, launch.args, {
+      cwd: programDir,
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: !showConsole,
+      windowsVerbatimArguments: process.platform === 'win32' && ['.bat', '.cmd'].includes(path.extname(target).toLowerCase())
+    });
+    child.once('error', error => {
+      log(`Startfehler bei '${relative}'`, error);
+      if (!settled) {
+        settled = true;
+        if (launchTimer) clearTimeout(launchTimer);
+        reject(new Error(`${relative} konnte nicht gestartet werden: ${error.message}`));
+      }
+    });
+    child.once('spawn', () => {
+      spawned = true;
+      const pid = child.pid;
+      child.unref();
+      log(`Startprozess erzeugt: ${relative}`, `PID=${pid || 'unbekannt'}`);
+      // Kurzes Beobachtungsfenster erkennt Startskripte, die sofort mit Fehlercode enden.
+      launchTimer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve({ started: true, pid: pid || null, process: relative });
+      }, 500);
+    });
+    child.once('exit', (code, signal) => {
+      if (!spawned) return;
+      log(`Startprozess beendet: ${relative}`, `Code=${code}; Signal=${signal}`);
+      if (!settled && (code !== 0 || signal)) {
+        settled = true;
+        if (launchTimer) clearTimeout(launchTimer);
+        reject(new Error(`${relative} wurde direkt nach dem Start mit Fehlercode ${code === null ? signal : code} beendet. Details stehen in ${LOG_PATH}.`));
+      }
+    });
   });
-
-  child.unref();
-
-  return { started: true };
 }
 
 function preserveUserData(program, oldDir, newDir) {
@@ -627,86 +733,56 @@ function collectFileManifest(root) {
 // ============================================================
 
 async function installProgram(programId) {
-  const programs = await getPrograms();
+  return runExclusive(`program:${validateId(programId)}`, async () => {
+    const programs = await getPrograms();
+    const program = programs.find(item => item.id === programId);
+    if (!program) throw new Error('Programm wurde nicht gefunden.');
+    if (program.state.installed) throw new Error('Programm ist bereits installiert.');
 
-  const program = programs.find(item => item.id === programId);
+    const temp = createTempDirectory('install-');
+    const archive = path.join(temp, 'program.zip');
+    const target = programDirectory(program);
+    try {
+      await downloadProgramArchive(programId, archive);
+      if (fs.existsSync(target)) {
+        const failedRoot = path.join(BACKUP_ROOT, 'Failed-Installations', safeFolderName(program.name, programId));
+        fs.mkdirSync(failedRoot, { recursive: true });
+        const failedPath = path.join(failedRoot, new Date().toISOString().replace(/[:.]/g, '-') );
+        moveDirectory(target, failedPath);
+      }
+      fs.mkdirSync(target, { recursive: true });
+      const extracted = extractZipSafely(archive, target);
+      log(`Programmpaket entpackt: ${program.name}`, `${extracted.entries} Einträge; ${extracted.bytes} Bytes; ${target}`);
 
-  if (!program) {
-    throw new Error('Programm wurde nicht gefunden.');
-  }
+      const installResult = runProgramFile(program, target, 'installation');
+      if (!installResult.completed && !installResult.skipped) {
+        throw new Error('Das Installationsskript wurde nicht vollständig abgewartet. Setze execution.wait_for_installation auf true.');
+      }
 
-  if (program.state.installed) {
-    throw new Error('Programm ist bereits installiert.');
-  }
-
-  const temp = fs.mkdtempSync(
-    path.join(TEMP_ROOT, 'core-install-')
-  );
-
-  const archive = path.join(temp, 'program.zip');
-  const target = programDirectory(program);
-
-  try {
-    // Nur das ZIP wird temporär gespeichert. Die Programmdaten selbst
-    // werden direkt in den endgültigen APPDATA-Zielordner entpackt.
-    await downloadProgramArchive(programId, archive);
-
-    fs.mkdirSync(target, { recursive: true });
-    extractZipSafely(archive, target);
-
-    // Das Installationsskript läuft erst nach dem Entpacken und direkt
-    // aus dem endgültigen Programmordner.
-    runProgramFile(program, target, 'installation');
-
-    const installed = readInstalled();
-
-    installed[programId] = {
-      name: program.name || programId,
-      version: program.version || '0.0.0',
-      folder: target,
-      installed: true
-    };
-
-    writeInstalled(installed);
-
-    return {
-      success: true,
-      programs: await getPrograms()
-    };
-  } catch (error) {
-    // Den entpackten Ordner absichtlich behalten. So bleiben Dateien
-    // für Diagnose und einen erneuten Installationsversuch verfügbar.
-    throw new Error(
-      `${error.message}\n\nProgrammdateien liegen unter: ${target}`
-    );
-  } finally {
-    fs.rmSync(temp, {
-      recursive: true,
-      force: true
-    });
-  }
+      await mutateInstalled(installed => {
+        installed[programId] = { name: program.name || programId, version: program.version || '0.0.0', folder: target, installed: true, installedAt: new Date().toISOString() };
+      });
+      log(`Installation abgeschlossen: ${program.name}`);
+      return { success: true };
+    } catch (error) {
+      log(`Installation fehlgeschlagen: ${program.name}`, error);
+      throw new Error(`${error.message}\n\nProgrammdateien liegen unter: ${target}`);
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  });
 }
 
 async function startProgram(programId) {
-  const programs = await getPrograms();
-
-  const program = programs.find(item => item.id === programId);
-
-  if (!program) {
-    throw new Error('Programm wurde nicht gefunden.');
-  }
-
-  if (!program.state.installed) {
-    throw new Error('Programm ist nicht installiert.');
-  }
-
-  runProgramFile(
-    program,
-    programDirectory(program),
-    'start'
-  );
-
-  return { success: true };
+  return runExclusive(`program:${validateId(programId)}`, async () => {
+    const programs = await getPrograms();
+    const program = programs.find(item => item.id === programId);
+    if (!program) throw new Error('Programm wurde nicht gefunden.');
+    if (!program.state.installed) throw new Error('Programm ist nicht installiert.');
+    const result = await runProgramFile(program, programDirectory(program), 'start');
+    if (result.skipped) throw new Error('Für dieses Programm ist keine Startdatei konfiguriert oder die Startfunktion wurde deaktiviert.');
+    return { success: true, ...result };
+  });
 }
 
 // ============================================================
@@ -714,89 +790,58 @@ async function startProgram(programId) {
 // ============================================================
 
 async function updateProgram(programId) {
-  const programs = await getPrograms();
+  return runExclusive(`program:${validateId(programId)}`, async () => {
+    const programs = await getPrograms();
+    const program = programs.find(item => item.id === programId);
+    if (!program) throw new Error('Programm wurde nicht gefunden.');
+    if (!program.state.installed) throw new Error('Programm ist nicht installiert.');
+    if (!program.state.updateAvailable) throw new Error('Es ist kein Update verfügbar.');
 
-  const program = programs.find(item => item.id === programId);
-
-  if (!program) {
-    throw new Error('Programm wurde nicht gefunden.');
-  }
-
-  if (!program.state.installed) {
-    throw new Error('Programm ist nicht installiert.');
-  }
-
-  if (!program.state.updateAvailable) {
-    throw new Error('Es ist kein Update verfügbar.');
-  }
-
-  const temp = fs.mkdtempSync(
-    path.join(TEMP_ROOT, 'core-program-update-')
-  );
-
-  const archive = path.join(temp, 'program.zip');
-  const backup = path.join(temp, 'backup');
-  const target = programDirectory(program);
-  let backupCreated = false;
-  let updateCommitted = false;
-
-  try {
-    await downloadProgramArchive(programId, archive);
-
-    // Vor dem Austausch wird die bisherige Installation gesichert.
-    moveDirectory(target, backup);
-    backupCreated = true;
-
+    const temp = createTempDirectory('program-update-');
+    const archive = path.join(temp, 'program.zip');
+    const target = programDirectory(program);
+    const backupDir = path.join(BACKUP_ROOT, 'Program-Updates', safeFolderName(program.name, programId));
+    fs.mkdirSync(backupDir, { recursive: true });
+    const backup = path.join(backupDir, `${programId}-${Date.now()}-${program.state.localVersion}.bak`);
+    let backupCreated = false;
     try {
+      await downloadProgramArchive(programId, archive);
+      moveDirectory(target, backup);
+      backupCreated = true;
       fs.mkdirSync(target, { recursive: true });
-      extractZipSafely(archive, target);
+      const extracted = extractZipSafely(archive, target);
       preserveUserData(program, backup, target);
-
-      // Auch das Update-Skript läuft im endgültigen APPDATA-Ordner.
-      runProgramFile(program, target, 'update');
-
-      const installed = readInstalled();
-      installed[programId] = {
-        name: program.name || programId,
-        version: program.version || '0.0.0',
-        folder: target,
-        installed: true
-      };
-      writeInstalled(installed);
-
-      updateCommitted = true;
-    } catch (error) {
-      fs.rmSync(target, { recursive: true, force: true });
-      if (backupCreated && fs.existsSync(backup)) {
-        moveDirectory(backup, target);
-        backupCreated = false;
+      const updateResult = runProgramFile(program, target, 'update');
+      if (!updateResult.completed && !updateResult.skipped) {
+        throw new Error('Das Update-Skript wurde nicht vollständig abgewartet. Setze execution.wait_for_update auf true.');
       }
-      throw error;
+      await mutateInstalled(installed => {
+        installed[programId] = { name: program.name || programId, version: program.version || '0.0.0', folder: target, installed: true, installedAt: installed[programId]?.installedAt || new Date().toISOString(), updatedAt: new Date().toISOString() };
+      });
+      log(`Update abgeschlossen: ${program.name}`, `${extracted.entries} Einträge; ${extracted.bytes} Bytes; Backup=${backup}`);
+      return { success: true, backupPath: backup };
+    } catch (error) {
+      log(`Update fehlgeschlagen: ${program.name}`, error);
+      try {
+        if (backupCreated) {
+          fs.rmSync(target, { recursive: true, force: true });
+          if (fs.existsSync(backup)) moveDirectory(backup, target);
+        }
+        await mutateInstalled(installed => {
+          if (installed[programId]) {
+            installed[programId].version = program.state.localVersion;
+            installed[programId].installed = true;
+          }
+        });
+      } catch (restoreError) {
+        log(`Wiederherstellung fehlgeschlagen: ${program.name}`, restoreError);
+        throw new Error(`${error.message}\nZusätzlich ist die Wiederherstellung fehlgeschlagen: ${restoreError.message}\nBackup: ${backup}`);
+      }
+      throw new Error(`${error.message}\nDie vorherige Version wurde wiederhergestellt. Backup: ${backup}`);
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
     }
-
-    if (updateCommitted && fs.existsSync(backup)) {
-      fs.rmSync(backup, { recursive: true, force: true });
-      backupCreated = false;
-    }
-
-    return {
-      success: true,
-      programs: await getPrograms()
-    };
-  } finally {
-    if (
-      backupCreated &&
-      fs.existsSync(backup) &&
-      !fs.existsSync(target)
-    ) {
-      moveDirectory(backup, target);
-    }
-
-    fs.rmSync(temp, {
-      recursive: true,
-      force: true
-    });
-  }
+  });
 }
 
 // ============================================================
@@ -804,41 +849,31 @@ async function updateProgram(programId) {
 // ============================================================
 
 async function uninstallProgram(programId) {
-  const programs = await getPrograms();
+  return runExclusive(`program:${validateId(programId)}`, async () => {
+    const programs = await getPrograms();
+    const program = programs.find(item => item.id === programId);
+    if (!program) throw new Error('Programm wurde nicht gefunden.');
+    if (!program.state.installed) throw new Error('Programm ist nicht installiert.');
+    const target = programDirectory(program);
+    const uninstallResult = runProgramFile(program, target, 'uninstallation');
+    if (!uninstallResult.completed && !uninstallResult.skipped) {
+      throw new Error('Das Deinstallationsskript wurde nicht vollständig abgewartet. Setze execution.wait_for_uninstallation auf true.');
+    }
 
-  const program = programs.find(item => item.id === programId);
-
-  if (!program) {
-    throw new Error('Programm wurde nicht gefunden.');
-  }
-
-  if (!program.state.installed) {
-    throw new Error('Programm ist nicht installiert.');
-  }
-
-  const target = programDirectory(program);
-
-  runProgramFile(
-    program,
-    target,
-    'uninstallation'
-  );
-
-  fs.rmSync(target, {
-    recursive: true,
-    force: true
+    // Vor dem Entfernen wird eine Wiederherstellungskopie aufbewahrt.
+    const backupDir = path.join(BACKUP_ROOT, 'Uninstalled-Programs');
+    fs.mkdirSync(backupDir, { recursive: true });
+    const backup = path.join(backupDir, `${safeFolderName(program.name, programId)}-${Date.now()}`);
+    moveDirectory(target, backup);
+    try {
+      await mutateInstalled(installed => { delete installed[programId]; });
+    } catch (error) {
+      if (!fs.existsSync(target) && fs.existsSync(backup)) moveDirectory(backup, target);
+      throw error;
+    }
+    log(`Programm deinstalliert: ${program.name}`, `Sicherung=${backup}`);
+    return { success: true, backupPath: backup };
   });
-
-  const installed = readInstalled();
-
-  delete installed[programId];
-
-  writeInstalled(installed);
-
-  return {
-    success: true,
-    programs: await getPrograms()
-  };
 }
 
 // ============================================================
@@ -957,47 +992,26 @@ async function getConfiguredStoreVersion() {
 // ============================================================
 
 function createFullBackup() {
-  fs.mkdirSync(BACKUP_ROOT, {
-    recursive: true
-  });
-
-  const stamp = new Date()
-    .toISOString()
-    .replace(/[:.]/g, '-');
-
-  const backupPath = path.join(
-    BACKUP_ROOT,
-    `Core-Store-Backup-${stamp}.zip`
-  );
-
+  fs.mkdirSync(BACKUP_ROOT, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupPath = path.join(BACKUP_ROOT, `Core-Network-Backup-${stamp}.zip`);
   const zip = new AdmZip();
-  const installRoot = path.dirname(process.execPath);
 
-  if (fs.existsSync(DATA_ROOT)) {
-    zip.addLocalFolder(DATA_ROOT, 'Core Network');
+  // Alle Daten sichern, aber Backups/Temp auslassen, damit keine rekursiven
+  // Backups und keine unvollständigen temporären Downloads in das Archiv geraten.
+  for (const entry of fs.readdirSync(CORE_ROOT, { withFileTypes: true })) {
+    if (entry.name === 'Backups' || entry.name === 'Temp') continue;
+    const full = path.join(CORE_ROOT, entry.name);
+    if (entry.isDirectory()) zip.addLocalFolder(full, `Core Network/${entry.name}`);
+    else if (entry.isFile()) zip.addLocalFile(full, 'Core Network');
   }
 
-  if (fs.existsSync(installRoot)) {
-    zip.addLocalFolder(
-      installRoot,
-      'Core Store Installation'
-    );
-  }
-
-  zip.addFile(
-    'Backup-Information.json',
-    Buffer.from(
-      JSON.stringify({
-        createdAt: new Date().toISOString(),
-        appVersion: APP_VERSION,
-        dataRoot: DATA_ROOT,
-        appRoot: APP_ROOT
-      }, null, 2)
-    )
-  );
-
+  zip.addFile('Backup-Information.json', Buffer.from(JSON.stringify({
+    createdAt: new Date().toISOString(), appVersion: APP_VERSION,
+    coreRoot: CORE_ROOT, storeRoot: STORE_ROOT, appRoot: APP_ROOT
+  }, null, 2)));
   zip.writeZip(backupPath);
-
+  log('Vollständiges CORE-Network-Backup erstellt', backupPath);
   return backupPath;
 }
 
@@ -1074,14 +1088,14 @@ async function startStoreUpdate() {
     throw new Error('Es ist kein Core-Store-Update verfügbar.');
   }
 
-  const temp = fs.mkdtempSync(
-    path.join(TEMP_ROOT, 'core-store-update-')
-  );
+  fs.mkdirSync(TEMP_ROOT, { recursive: true });
+  const temp = fs.mkdtempSync(path.join(TEMP_ROOT, 'core-store-update-'));
 
   const zipPath = path.join(temp, 'update.zip');
-  const backupPath = createFullBackup();
+  let backupPath = '';
 
   try {
+    backupPath = createFullBackup();
     await downloadToFile(
       '/api/store/download',
       zipPath
@@ -1117,7 +1131,6 @@ param(
   [string]$TempRoot,
   [string]$BackupZip,
   [string]$DataRoot,
-  [string]$InstallRoot,
   [string]$StatusPath,
   [string]$SupportUrl,
   [string]$NewVersion
@@ -1213,17 +1226,14 @@ catch {
     Expand-Archive -LiteralPath $BackupZip -DestinationPath $RestoreTemp -Force
 
     $DataBackup = Join-Path $RestoreTemp 'Core Network'
-    $InstallBackup = Join-Path $RestoreTemp 'Core Store Installation'
-
     if (Test-Path -LiteralPath $DataBackup) {
+      New-Item -ItemType Directory -Path $DataRoot -Force | Out-Null
       Get-ChildItem -LiteralPath $DataBackup -Force | ForEach-Object {
+        $Destination = Join-Path $DataRoot $_.Name
+        if (Test-Path -LiteralPath $Destination) {
+          Remove-Item -LiteralPath $Destination -Recurse -Force
+        }
         Copy-Item -LiteralPath $_.FullName -Destination $DataRoot -Recurse -Force
-      }
-    }
-
-    if (Test-Path -LiteralPath $InstallBackup) {
-      Get-ChildItem -LiteralPath $InstallBackup -Force | ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination $InstallRoot -Recurse -Force
       }
     }
 
@@ -1385,7 +1395,6 @@ catch {
           temp,
           backupPath,
           DATA_ROOT,
-          path.dirname(executable),
           statusPath,
           info.supportUrl || '',
           info.remoteVersion || ''
@@ -1558,7 +1567,11 @@ function registerIpc() {
   );
 
   ipcMain.handle('app:open-data-folder', () =>
-    shell.openPath(DATA_ROOT)
+    shell.openPath(CORE_ROOT)
+  );
+
+  ipcMain.handle('app:open-logs-folder', () =>
+    shell.openPath(LOG_ROOT)
   );
 
   ipcMain.handle(
@@ -1582,6 +1595,9 @@ function registerIpc() {
 // ============================================================
 // START
 // ============================================================
+
+process.on('uncaughtException', error => log('Nicht abgefangener Hauptprozessfehler', error));
+process.on('unhandledRejection', error => log('Nicht abgefangene Promise-Ablehnung', error));
 
 app.whenReady().then(() => {
   try {
