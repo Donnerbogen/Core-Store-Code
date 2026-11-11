@@ -483,20 +483,41 @@ def programs():
     try:
         config = get_programs_config()
         result = []
+        seen_ids = set()
+        seen_folders = set()
 
-        for original in config["programs"]:
+        for index, original in enumerate(config["programs"], start=1):
             try:
                 program = validate_program(dict(original))
+                program_id = program["id"]
+                if program_id in seen_ids:
+                    raise ValueError(f"Doppelte Programm-ID: {program_id}")
+                seen_ids.add(program_id)
+
+                display_name = str(program.get("name") or program_id).strip()
+                if not display_name or len(display_name) > 100:
+                    raise ValueError("Programmname fehlt oder ist zu lang.")
+                local_folder = re.sub(r'[<>:\"/\\|?*\x00-\x1F]', '_', display_name).rstrip('. ')
+                if re.fullmatch(r'(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?', local_folder, re.IGNORECASE):
+                    local_folder = '_' + local_folder
+                if local_folder.casefold() in {'core store', 'installer'}:
+                    local_folder += ' Programm'
+                if local_folder.casefold() in {'backups', 'temp'}:
+                    raise ValueError(f"Der Programmname '{display_name}' ist für einen reservierten CORE-Network-Ordner nicht zulässig.")
+                if local_folder.casefold() in seen_folders:
+                    raise ValueError(f"Mehrere Programme verwenden denselben Zielordner: {display_name}")
+                seen_folders.add(local_folder.casefold())
+
+                version = str(program.get("version") or "0.0.0")
+                if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+                    raise ValueError(f"Ungültige Programmversion: {version}")
 
                 if program.get("enabled", True):
                     result.append(program)
+            except Exception as exc:
+                raise ValueError(f"Fehler in config/programs.json bei Eintrag {index}: {exc}") from exc
 
-            except Exception:
-                continue
-
-        return jsonify({
-            "programs": result
-        })
+        return jsonify({"programs": result})
 
     except Exception as exc:
         return jsonify({
