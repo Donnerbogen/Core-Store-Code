@@ -1,6 +1,4 @@
-\
-; Core Store wird zusammen mit allen CORE-Network-Dateien im Roaming-Profil abgelegt.
-; customInit setzt das Standard- und Installationsziel des NSIS-Installers.
-!macro customInit
+; Core Store wird immer im gemeinsamen CORE-Network-Ordner installiert.
+!macro preInit
   StrCpy $INSTDIR "$APPDATA\Core Network\Core Store"
 !macroend
