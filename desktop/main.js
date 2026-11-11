@@ -907,6 +907,13 @@ function getCachedSupportUrl() {
   }
 }
 
+// Wird vom Update-Button über store:check-update-for-action aufgerufen.
+// Die Aktionsprüfung verwendet dieselbe zuverlässige Versionsprüfung wie
+// die allgemeine Store-Update-Anzeige, damit beide Anzeigen identisch bleiben.
+async function checkStoreUpdateForAction() {
+  return getStoreUpdateInfo();
+}
+
 async function getStoreUpdateInfo() {
   const data = await apiJson('/api/store/version');
 
