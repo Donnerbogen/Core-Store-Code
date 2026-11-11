@@ -248,7 +248,7 @@ async function handleProgramAction(action, id) {
       toast(`${name} wurde installiert.`);
     } else if (action === 'start') {
       await window.coreStore.startProgram(id);
-      toast(`${name} wurde gestartet.`);
+      toast(`${name}: Startprozess wurde gestartet. Falls sich kein Fenster öffnet, prüfe das Startskript und die Protokolldatei im Core-Store-Ordner.`);
     } else if (action === 'update') {
       toast(`${name} wird aktualisiert ...`);
       await window.coreStore.updateProgram(id);
@@ -305,6 +305,10 @@ function bindEvents() {
   $('#installedRefresh').addEventListener('click', refreshPrograms);
   $('#retryConnection').addEventListener('click', refreshPrograms);
   $('#openDataFolder').addEventListener('click', () => window.coreStore.openDataFolder());
+  $('#openLogsFolder').addEventListener('click', async () => {
+    try { await window.coreStore.openLogsFolder(); }
+    catch (error) { toast(error.message || String(error), 'error'); }
+  });
   $('#checkStoreUpdate').addEventListener('click', async () => {
     await refreshStoreVersion();
     if (state.storeUpdate?.available) {
