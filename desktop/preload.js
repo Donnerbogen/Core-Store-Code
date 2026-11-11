@@ -15,5 +15,6 @@ contextBridge.exposeInMainWorld('coreStore', {
   acknowledgeUpdateFailure: () => ipcRenderer.invoke('store:acknowledge-update-failure'),
   openSupportWebsite: () => ipcRenderer.invoke('store:open-support-website'),
   openDataFolder: () => ipcRenderer.invoke('app:open-data-folder'),
+  openLogsFolder: () => ipcRenderer.invoke('app:open-logs-folder'),
   openProgramFolder: id => ipcRenderer.invoke('app:open-program-folder', id)
 });
