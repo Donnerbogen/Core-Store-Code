@@ -180,7 +180,7 @@ async function refreshStoreVersion() {
 async function showPendingUpdateFailure() {
   try {
     const failure = await window.coreStore.getUpdateFailure();
-    if (!failure) return;
+    if (!failure || failure.acknowledged) return;
     const versionText = failure.failedVersion ? ` (Version ${failure.failedVersion})` : '';
     const code = failure.errorCode || 'CSU-999';
     const reason = failure.error ? `
